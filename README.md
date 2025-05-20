@@ -3,3 +3,4 @@ Python script for the lazy that automatically manages Aerodrome CL deposits so t
 
 ### To do
 - Automatically fund gas: sell 10-20 USDC for ETH when ETH balance drops below threshold
+- modular retries
