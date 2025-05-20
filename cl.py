@@ -956,11 +956,11 @@ async def handle_status_action(context: CallbackContext):
 
     # LP Position
     if bot_state["aerodrome_lp_nft_id"]:
-        status_lines.append(f"Aerodrome LP NFT ID: `{bot_state['aerodrome_lp_nft_id']}`")
+        status_lines.append(f"💰 Aerodrome LP NFT ID: `{bot_state['aerodrome_lp_nft_id']}`")
         position_details = await get_lp_position_details(context, bot_state["aerodrome_lp_nft_id"])
         price_wblt_usdc, current_tick = await get_aerodrome_pool_price_and_tick()
 
-        if position_details and price_wblt_usdc is not None:
+        if position_details and price_wblt_usdc is not None and current_tick is not None:
             tick_lower_lp = position_details['tickLower']
             tick_upper_lp = position_details['tickUpper']
 
@@ -971,41 +971,89 @@ async def handle_status_action(context: CallbackContext):
             # Price of WBLT in USDC
             decimal_adj_factor_for_price = Decimal(10)**(wblt_decimals_val - usdc_decimals_val)
             
-            price_at_tick_lower = (Decimal("1.0001")**Decimal(tick_lower_lp)) * decimal_adj_factor_for_price
-            price_at_tick_upper = (Decimal("1.0001")**Decimal(tick_upper_lp)) * decimal_adj_factor_for_price
+            price_at_tick_lower_lp = (Decimal("1.0001")**Decimal(tick_lower_lp)) * decimal_adj_factor_for_price
+            price_at_tick_upper_lp = (Decimal("1.0001")**Decimal(tick_upper_lp)) * decimal_adj_factor_for_price
                         
-            status_lines.append(f"  LP Tick Range: `{tick_lower_lp}` to `{tick_upper_lp}`")
-            status_lines.append(f"  LP Price Range (WBLT/USDC): `${price_at_tick_lower:.4f}` - `${price_at_tick_upper:.4f}`")
-            status_lines.append(f"  Current Pool Tick: `{current_tick}`")
-            status_lines.append(f"  Current WBLT Price: `{price_wblt_usdc:.4f} USDC`")
+            status_lines.append(f"  📐 Tick Range: `{tick_lower_lp}` to `{tick_upper_lp}`")
+            status_lines.append(f"  💲 Price Range: `{price_at_tick_lower_lp:.4f}` - `{price_at_tick_upper_lp:.4f} USDC`")
 
-            if current_tick >= tick_lower_lp and current_tick < tick_upper_lp:
-                status_lines.append("  Status: ✅ **In Range**")
+            # --- Calculate and Display Buffer Trigger Prices ---
+            actual_tick_span_lp = tick_upper_lp - tick_lower_lp
+            lower_trigger_tick_for_status = tick_lower_lp
+            upper_trigger_tick_for_status = tick_upper_lp
+
+            if actual_tick_span_lp > 0:
+                try:
+                    pool_tick_spacing = await asyncio.to_thread(aerodrome_pool_contract.functions.tickSpacing().call)
+                    if pool_tick_spacing > 0:
+                        raw_buffer_in_ticks = actual_tick_span_lp * (REBALANCE_TRIGGER_BUFFER_PERCENTAGE / Decimal(100))
+                        num_tick_spacings_for_buffer = int(Decimal(raw_buffer_in_ticks) / Decimal(pool_tick_spacing))
+
+                        if num_tick_spacings_for_buffer == 0 and raw_buffer_in_ticks > 0:
+                            num_tick_spacings_for_buffer = 1
+                        
+                        buffer_tick_amount_aligned = num_tick_spacings_for_buffer * pool_tick_spacing
+
+                        if (2 * buffer_tick_amount_aligned) >= actual_tick_span_lp:
+                            if actual_tick_span_lp > pool_tick_spacing:
+                                buffer_tick_amount_aligned = pool_tick_spacing
+                            else:
+                                buffer_tick_amount_aligned = 0
+                        
+                        lower_trigger_tick_for_status = tick_lower_lp + buffer_tick_amount_aligned
+                        upper_trigger_tick_for_status = tick_upper_lp - buffer_tick_amount_aligned
+
+                        price_at_lower_trigger = (Decimal("1.0001")**Decimal(lower_trigger_tick_for_status)) * decimal_adj_factor_for_price
+                        price_at_upper_trigger = (Decimal("1.0001")**Decimal(upper_trigger_tick_for_status)) * decimal_adj_factor_for_price
+                        
+                        status_lines.append(
+                            f"  🔔 Rebalance Trigger Prices: `< {price_at_lower_trigger:.4f}` and `> {price_at_upper_trigger:.4f}` "
+                            f"`({REBALANCE_TRIGGER_BUFFER_PERCENTAGE}%)`"
+                        )
+                    else:
+                        status_lines.append("  ❗ Could not determine buffer: Invalid tickSpacing.")
+                except Exception as e_buffer_calc:
+                    logger.warning(f"Could not calculate buffer trigger prices for status: {e_buffer_calc}")
+                    status_lines.append("  ❗ Could not determine buffer trigger prices.")
             else:
-                status_lines.append("  Status: ❌ **Out of Range**")
+                 status_lines.append("  ❗ LP range span is zero or negative, cannot calculate buffer.")
+
+            status_lines.append(f"  📈 Pool Tick: `{current_tick}`")
+            status_lines.append(f"  💵 WBLT Price: `{price_wblt_usdc:.4f} USDC`")
+
+            is_in_actual_range = current_tick >= tick_lower_lp and current_tick < tick_upper_lp
+            range_status_emoji = "✅ **In Range**" if is_in_actual_range else "❌ **Out of Range**"
+            is_within_buffer_zone = current_tick >= lower_trigger_tick_for_status and current_tick < upper_trigger_tick_for_status
             
-            status_lines.append(f"  LP Liquidity (Abstract): `{position_details['liquidity']}`")
-            
-            # Principal Value
+            if is_in_actual_range:
+                status_lines.append(f"  ✨ Status: {range_status_emoji}")
+                if not is_within_buffer_zone and actual_tick_span_lp > 0 :
+                     status_lines.append("  ⚠️ Price is near edge, approaching rebalance trigger.")
+            else:
+                status_lines.append(f"  ✨ Status: {range_status_emoji} (Rebalance likely needed/pending)")
+
+
+            status_lines.append(f"  💧 Liquidity (Abstract): `{position_details['liquidity']}`")
+
             principal_wblt_usd = bot_state["current_lp_principal_wblt_amount"] * price_wblt_usdc
             total_principal_usd = principal_wblt_usd + bot_state["current_lp_principal_usdc_amount"]
-            status_lines.append(f"  Principal in LP: `{bot_state['current_lp_principal_wblt_amount']:.4f} WBLT` & `{bot_state['current_lp_principal_usdc_amount']:.2f} USDC`")
-            status_lines.append(f"  Est. Principal Value: `${total_principal_usd:.2f}`")
+            status_lines.append(f"  💼 Principal: `{bot_state['current_lp_principal_wblt_amount']:.4f} WBLT` & `{bot_state['current_lp_principal_usdc_amount']:.2f} USDC`")
+            status_lines.append(f"  💲 Est. Value: `${total_principal_usd:.2f}`")
 
             pending_aero = await get_pending_aero_rewards(context, bot_state["aerodrome_lp_nft_id"])
-            status_lines.append(f"  Pending AERO: `{pending_aero:.4f} AERO`")
+            status_lines.append(f"  🎁 Pending AERO: `{pending_aero:.4f} AERO`")
         else:
             status_lines.append("  🤷‍♀️ Could not fetch LP position details or pool price.")
     else:
-        status_lines.append("No active Aerodrome LP position\.")
+        status_lines.append("❌ No active Aerodrome LP position\.")
     status_lines.append("---")
 
-    status_lines.append(f"Strategy: `{bot_state['current_strategy']}`")
+    status_lines.append(f"🧠 Strategy: `{bot_state['current_strategy']}`")
     profit_value_str = f"{bot_state['accumulated_profit_usdc']:.2f}"
-    status_lines.append(f"Accumulated Profit (Withdrawable): `${profit_value_str}` USDC")
-    status_lines.append(f"Operations Halted: {'YES' if bot_state['operations_halted'] else 'NO'}")
-    status_lines.append(f"Action Lock: {'ENGAGED' if bot_state['is_processing_action'] else 'FREE'}")
-    status_lines.append(f"Initial Setup Pending: {'YES' if bot_state['initial_setup_pending'] else 'NO'}")
+    status_lines.append(f"💸 Accumulated Profit (Withdrawable): `${profit_value_str}` USDC")
+    status_lines.append(f"🛑 Operations Halted: {'YES' if bot_state['operations_halted'] else 'NO'}")
+    status_lines.append(f"🔒 Action Lock: {'ENGAGED' if bot_state['is_processing_action'] else 'FREE'}")
+    status_lines.append(f"🛠️ Initial Setup Pending: {'YES' if bot_state['initial_setup_pending'] else 'NO'}")
 
     bot_state["last_telegram_status_update_time"] = time.time()
     await save_state_async()
