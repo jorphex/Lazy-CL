@@ -1805,7 +1805,6 @@ async def handle_startup_withdraw_unstaked_nft_action(context: CallbackContext):
 
         if decrease_receipt and decrease_receipt.status == 1:
             await send_tg_message(context, f"✅ Liquidity decrease successful for NFT {nft_id}. Collecting tokens...", menu_type=None)
-            await asyncio.sleep(10) # Give some time for state to settle before collect
 
             # Collect Tokens
             collect_params = {
@@ -1887,7 +1886,6 @@ async def handle_startup_withdraw_unstaked_nft_action(context: CallbackContext):
     bot_state["initial_setup_pending"] = True
     bot_state["operations_halted"] = True
 
-    await asyncio.sleep(5) # Allow RPC to catch up for final balance check
     final_usdc_balance = await get_token_balance(usdc_token_contract, BOT_WALLET_ADDRESS)
     await send_tg_message(
         context,
