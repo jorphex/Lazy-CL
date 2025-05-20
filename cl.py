@@ -8,6 +8,7 @@ import requests
 from web3 import Web3
 from hexbytes import HexBytes
 from web3.exceptions import TransactionNotFound, ContractLogicError
+import functools
 import telegramify_markdown
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext, CallbackQueryHandler
@@ -46,6 +47,8 @@ PERIODIC_STATUS_UPDATE_INTERVAL_SECONDS = 6 * 60 * 60
 TRANSACTION_TIMEOUT_SECONDS = 360
 USER_PROFIT_WITHDRAWAL_ADDRESS = Web3.to_checksum_address("eoa for profit withdrawal")
 INITIAL_LP_NFT_ID_CONFIG = None # probably not needed anymore
+MIN_SWAP_THRESHOLD_WBLT = Decimal("0.1")
+MIN_SWAP_THRESHOLD_USDC = Decimal("1.0")
 
 # Gas
 MAX_FEE_PER_GAS_GWEI = Decimal("0.005")
@@ -93,7 +96,7 @@ bot_state = {
     "last_telegram_status_update_time": 0,
     "last_aero_claim_time": 0,
     "operations_halted": True,
-    "is_processing_action": False, # to to prevent overlapping operations
+    "is_processing_action": False, # to prevent overlapping operations
     "initial_setup_pending": True
 }
 
@@ -192,7 +195,7 @@ async def send_tg_message(context: CallbackContext, message: str, menu_type="mai
         keyboard = await get_startup_staked_lp_menu()
 
     try:
-        safe_message = telegramify_markdown.markdownify(message) # Assuming you've added telegramify
+        safe_message = telegramify_markdown.markdownify(message)
 
         await context.bot.send_message(
             chat_id=TELEGRAM_ADMIN_USER_ID,
@@ -203,6 +206,92 @@ async def send_tg_message(context: CallbackContext, message: str, menu_type="mai
     except Exception as e:
         logger.error(f"Error sending Telegram message: {e} - Original Message: {message[:200]} - Safe Message: {safe_message[:200] if 'safe_message' in locals() else 'N/A'}")
 
+async def calculate_optimal_deposit_amounts(
+    current_tick: int,
+    tick_lower: int,
+    tick_upper: int,
+    balance0_wei: int,
+    balance1_wei: int
+) -> tuple[int, int]:
+
+    logger.info(f"Calculating optimal deposit: current_tick={current_tick}, range=[{tick_lower},{tick_upper}], bal0={balance0_wei}, bal1={balance1_wei}")
+
+    if tick_lower >= tick_upper:
+        logger.error("Invalid tick range: tick_lower >= tick_upper.")
+        return 0, 0
+
+    # Convert balances to Decimal for precision
+    dec_balance0 = Decimal(balance0_wei)
+    dec_balance1 = Decimal(balance1_wei)
+
+    sqrt_P_current = Decimal("1.0001") ** (Decimal(current_tick) / Decimal(2))
+    sqrt_P_lower   = Decimal("1.0001") ** (Decimal(tick_lower) / Decimal(2))
+    sqrt_P_upper   = Decimal("1.0001") ** (Decimal(tick_upper) / Decimal(2))
+
+    logger.debug(f"SqrtPrices: current={sqrt_P_current}, lower={sqrt_P_lower}, upper={sqrt_P_upper}")
+
+    optimal_amount0_wei = Decimal(0)
+    optimal_amount1_wei = Decimal(0)
+
+    # Case A: Price is below the range (or at the lower tick) - only token0
+    if sqrt_P_current <= sqrt_P_lower:
+        logger.info("Price is at or below lower tick. Will use only token0 (WBLT).")
+        optimal_amount0_wei = dec_balance0
+        optimal_amount1_wei = Decimal(0)
+
+    # Case B: Price is at or above the upper tick - only token1
+    elif sqrt_P_current >= sqrt_P_upper:
+        logger.info("Price is at or above upper tick. Will use only token1 (USDC).")
+        optimal_amount0_wei = Decimal(0)
+        optimal_amount1_wei = dec_balance1
+        
+    # Case C: Price is within the range - potentially both tokens
+    else:
+        logger.info("Price is within the range. Calculating optimal L and amounts for both tokens.")
+
+        denom_for_L_from_bal0 = (Decimal(1) / sqrt_P_current) - (Decimal(1) / sqrt_P_upper)
+        denom_for_L_from_bal1 = sqrt_P_current - sqrt_P_lower
+        
+        logger.debug(f"Denom0 (for L from bal0): {denom_for_L_from_bal0}, Denom1 (for L from bal1): {denom_for_L_from_bal1}")
+
+        L_max_from_token0 = Decimal('inf')
+        if denom_for_L_from_bal0 > Decimal("1e-18"):
+            L_max_from_token0 = dec_balance0 / denom_for_L_from_bal0
+        else:
+            logger.info("Denominator for L from balance0 is near zero; token0 is not the constraint from this side.")
+
+        L_max_from_token1 = Decimal('inf')
+        if denom_for_L_from_bal1 > Decimal("1e-18"):
+            L_max_from_token1 = dec_balance1 / denom_for_L_from_bal1
+        else:
+            logger.info("Denominator for L from balance1 is near zero; token1 is not the constraint from this side.")
+            
+        logger.info(f"L_max if all token0 used: {L_max_from_token0}, L_max if all token1 used: {L_max_from_token1}")
+
+        L_optimal = min(L_max_from_token0, L_max_from_token1)
+        
+        if L_optimal == Decimal('inf') or L_optimal <= Decimal(0):
+            logger.error(f"Optimal L calculated as {L_optimal}. This is unexpected. Defaulting to 0 amounts.")
+            optimal_amount0_wei = Decimal(0)
+            optimal_amount1_wei = Decimal(0)
+        else:
+            logger.info(f"Optimal L determined: {L_optimal}")
+            
+            if denom_for_L_from_bal0 > Decimal("1e-18"):
+                 optimal_amount0_wei = L_optimal * denom_for_L_from_bal0
+            else:
+                 optimal_amount0_wei = Decimal(0)
+
+            if denom_for_L_from_bal1 > Decimal("1e-18"):
+                 optimal_amount1_wei = L_optimal * denom_for_L_from_bal1
+            else:
+                 optimal_amount1_wei = Decimal(0)
+
+    final_amount0 = min(dec_balance0, optimal_amount0_wei.to_integral_value(rounding=ROUND_DOWN))
+    final_amount1 = min(dec_balance1, optimal_amount1_wei.to_integral_value(rounding=ROUND_DOWN))
+    
+    logger.info(f"Calculated optimal deposit amounts (wei): token0={final_amount0}, token1={final_amount1}")
+    return int(final_amount0), int(final_amount1)
 
 # --- Web3 ---
 def check_connection():
@@ -214,91 +303,115 @@ def check_connection():
 def get_nonce():
     return w3.eth.get_transaction_count(BOT_WALLET_ADDRESS, 'pending')
 
-def _send_and_wait_for_transaction(tx_params_dict_to_sign, description="Transaction"):
-    logger.debug(f"Attempting to sign and send for {description}. Input type: {type(tx_params_dict_to_sign)}. Value: {str(tx_params_dict_to_sign)[:300]}")
-    
-    signed_tx_object = None
-
-    try:
-        if not isinstance(tx_params_dict_to_sign, dict):
-            logger.error(f"CRITICAL DEBUG: _send_and_wait_for_transaction expected a dict for {description}, but got {type(tx_params_dict_to_sign)}")
-            return None
-
-        tx_params = tx_params_dict_to_sign
-        
-        if 'gasPrice' not in tx_params and ('maxFeePerGas' not in tx_params or 'maxPriorityFeePerGas' not in tx_params):
-            base_fee = w3.eth.get_block('latest')['baseFeePerGas']
-            tx_params['maxPriorityFeePerGas'] = w3.to_wei(MAX_PRIORITY_FEE_PER_GAS_GWEI, 'gwei')
-            calculated_max_fee = base_fee + tx_params['maxPriorityFeePerGas']
-            buffer = w3.to_wei('0.001', 'gwei') 
-            tx_params['maxFeePerGas'] = calculated_max_fee + buffer
-            if tx_params['maxFeePerGas'] < tx_params['maxPriorityFeePerGas']:
-                tx_params['maxFeePerGas'] = tx_params['maxPriorityFeePerGas'] + buffer
-
-        if 'gas' not in tx_params:
-            try:
-                if 'chainId' not in tx_params:
-                     tx_params['chainId'] = w3.eth.chain_id
-                tx_params['gas'] = w3.eth.estimate_gas(tx_params)
-            except Exception as e:
-                logger.warning(f"Could not estimate gas for {description}: {e}. Using default 500,000. Params: {tx_params}")
-                tx_params['gas'] = 500000
-        
-        if 'chainId' not in tx_params:
-            tx_params['chainId'] = w3.eth.chain_id
-            logger.debug(f"Added chainId {tx_params['chainId']} for {description}")
-
-        logger.debug(f"Transaction parameters for signing ({description}): {tx_params}")
+def _send_and_wait_for_transaction(
+    tx_params_dict_to_sign,
+    description="Transaction",
+    max_retries: int = 2,
+    retry_delay_seconds: int = 15
+):
+    last_exception = None
+    for attempt in range(max_retries + 1):
+        tx_hash = None
         try:
+            logger.debug(f"Attempting to sign and send for {description} (Attempt {attempt + 1}/{max_retries + 1}).")
+
+            if not isinstance(tx_params_dict_to_sign, dict):
+                logger.error(f"CRITICAL DEBUG: _send_and_wait_for_transaction expected a dict for {description}, but got {type(tx_params_dict_to_sign)}")
+                return None
+
+            tx_params = tx_params_dict_to_sign.copy()
+
+            if 'nonce' not in tx_params or attempt > 0:
+                 current_wallet_nonce = w3.eth.get_transaction_count(BOT_WALLET_ADDRESS, 'pending')
+                 logger.info(f"Fetching fresh nonce for {description} (Attempt {attempt+1}): {current_wallet_nonce}")
+                 tx_params['nonce'] = current_wallet_nonce
+
+            if 'gasPrice' not in tx_params and ('maxFeePerGas' not in tx_params or 'maxPriorityFeePerGas' not in tx_params):
+                base_fee = w3.eth.get_block('latest')['baseFeePerGas']
+                tx_params['maxPriorityFeePerGas'] = w3.to_wei(MAX_PRIORITY_FEE_PER_GAS_GWEI, 'gwei')
+                calculated_max_fee = base_fee + tx_params['maxPriorityFeePerGas']
+                buffer = w3.to_wei('0.001', 'gwei')
+                tx_params['maxFeePerGas'] = calculated_max_fee + buffer
+                if tx_params['maxFeePerGas'] < tx_params['maxPriorityFeePerGas']:
+                    tx_params['maxFeePerGas'] = tx_params['maxPriorityFeePerGas'] + buffer
+            
+            if 'chainId' not in tx_params:
+                tx_params['chainId'] = w3.eth.chain_id
+
+            if 'gas' not in tx_params:
+                try:
+                    logger.debug(f"Estimating gas for {description} with params: {tx_params}")
+                    tx_params['gas'] = w3.eth.estimate_gas(tx_params)
+                except ContractLogicError as e_gas_estim_cle:
+                    logger.error(f"ContractLogicError during gas estimation for {description} (Attempt {attempt+1}): {e_gas_estim_cle}. Params: {tx_params}")
+                    last_exception = e_gas_estim_cle
+                    raise
+                except Exception as e_gas_estim:
+                    logger.warning(f"Could not estimate gas for {description} (Attempt {attempt+1}): {e_gas_estim}. Using default 500,000. Params: {tx_params}")
+                    tx_params['gas'] = 500000
+
+            logger.debug(f"Final transaction parameters for signing ({description}, Attempt {attempt+1}): {tx_params}")
             signed_tx_object = w3.eth.account.sign_transaction(tx_params, BOT_PRIVATE_KEY)
-            logger.debug(f"Signing successful for {description}. Signed object type: {type(signed_tx_object)}")
-        except Exception as signing_error:
-            logger.error(f"Error DURING SIGNING transaction for {description}: {signing_error}", exc_info=True)
-            return None
 
-        if not hasattr(signed_tx_object, 'raw_transaction'):
-            logger.error(f"Signed object for {description} LACKS raw_transaction attribute immediately after signing! Type: {type(signed_tx_object)}")
-            if signed_tx_object:
-                logger.error(f"Attributes of signed_tx_object: {dir(signed_tx_object)}")
-            return None
-        if signed_tx_object.raw_transaction is None:
-            logger.error(f"Signed object for {description} has raw_transaction attribute but it is None!")
-            return None
+            if not hasattr(signed_tx_object, 'raw_transaction') or signed_tx_object.raw_transaction is None:
+                logger.error(f"Failed to sign transaction properly for {description} (Attempt {attempt+1}). No raw_transaction.")
+                return None
 
-        tx_hash = w3.eth.send_raw_transaction(signed_tx_object.raw_transaction)
-        logger.info(f"{description} sent. Tx Hash: {tx_hash.hex()}")
+            tx_hash = w3.eth.send_raw_transaction(signed_tx_object.raw_transaction)
+            logger.info(f"{description} sent (Attempt {attempt+1}). Tx Hash: {tx_hash.hex()}")
 
-        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=TRANSACTION_TIMEOUT_SECONDS)
+            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=TRANSACTION_TIMEOUT_SECONDS)
 
-        if receipt.status == 1:
-            logger.info(f"{description} successful. Tx: {tx_hash.hex()}, Gas used: {receipt.gasUsed}")
-            time.sleep(15)
-            return receipt
+            if receipt and receipt.status == 1:
+                logger.info(f"{description} successful. Tx: {tx_hash.hex()}, Gas used: {receipt.gasUsed}")
+                return receipt
+            elif receipt and receipt.status == 0:
+                logger.error(f"{description} FAILED (Receipt Status 0) on chain. Tx: {tx_hash.hex()}, Gas used: {receipt.gasUsed}")
+                return receipt
+            else:
+                logger.error(f"{description} returned unexpected receipt: {receipt}. Assuming failure.")
+                last_exception = RuntimeError(f"Unexpected receipt for {description}")
+                if attempt < max_retries:
+                    logger.info(f"Retrying in {retry_delay_seconds}s...")
+                    time.sleep(retry_delay_seconds)
+                else:
+                    break
+                continue
+
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout,
+                  httpx.ReadTimeout, httpx.ConnectTimeout, httpx.ConnectError, httpx.ReadError, httpx.PoolTimeout) as net_err:
+            logger.warning(f"Network-related error during {description} (Attempt {attempt + 1}/{max_retries + 1}): {net_err}")
+            last_exception = net_err
+        except TransactionNotFound:
+            tx_hash_str = tx_hash.hex() if tx_hash else "N/A"
+            logger.error(f"{description} timed out (TransactionNotFound after {TRANSACTION_TIMEOUT_SECONDS}s) (Attempt {attempt + 1}/{max_retries + 1}). Tx Hash: {tx_hash_str}")
+            last_exception = TransactionNotFound(f"Transaction {tx_hash_str} not found after timeout.")
+        except ContractLogicError as cle:
+            logger.error(f"{description} ContractLogicError during prep/gas estimation (Attempt {attempt + 1}/{max_retries + 1}): {cle}")
+            last_exception = cle
+            raise
+        except ValueError as ve:
+            logger.error(f"{description} ValueError (Attempt {attempt + 1}/{max_retries + 1}): {ve}")
+            last_exception = ve
+            if "replacement transaction underpriced" in str(ve).lower() or \
+               "nonce too low" in str(ve).lower() or \
+               "known transaction" in str(ve).lower():
+                logger.warning("Nonce, gas pricing, or known transaction issue detected.")
+            else:
+                raise
+        except Exception as e:
+            tx_hash_str = tx_hash.hex() if tx_hash else "N/A"
+            logger.error(f"An unexpected error occurred during {description} (Attempt {attempt + 1}/{max_retries + 1}): {e}. Tx Hash: {tx_hash_str}", exc_info=True)
+            last_exception = e
+
+        if attempt < max_retries:
+            logger.info(f"Retrying {description} in {retry_delay_seconds}s due to: {type(last_exception).__name__}")
+            time.sleep(retry_delay_seconds)
         else:
-            logger.error(f"{description} FAILED. Tx: {tx_hash.hex()}, Status: {receipt.status}, Gas used: {receipt.gasUsed}")
+            logger.error(f"{description} ultimately failed after {max_retries + 1} attempts. Last error: {type(last_exception).__name__}: {last_exception}")
             return None
 
-    except TransactionNotFound:
-        current_tx_hash = 'N/A'
-        if 'tx_hash' in locals() and tx_hash:
-            current_tx_hash = tx_hash.hex()
-        logger.error(f"{description} timed out (not found after {TRANSACTION_TIMEOUT_SECONDS}s). Tx Hash: {current_tx_hash}")
-        return None
-    except ContractLogicError as cle:
-        current_tx_hash = 'N/A'
-        if 'tx_hash' in locals() and tx_hash:
-            current_tx_hash = tx_hash.hex()
-        logger.error(f"{description} ContractLogicError: {cle}. Tx Hash: {current_tx_hash}")
-        return None
-    except ValueError as ve: 
-        logger.error(f"{description} ValueError: {ve}. This might indicate a revert reason or issue with tx params.")
-        return None
-    except Exception as e:
-        current_tx_hash = 'N/A'
-        if 'tx_hash' in locals() and tx_hash:
-            current_tx_hash = tx_hash.hex()
-        logger.error(f"An unexpected error occurred during {description}: {e}. Tx Hash: {current_tx_hash}", exc_info=True)
-        return None
+    return None
 
 
 async def approve_token_spending(context: CallbackContext, token_contract, spender_address, amount_decimal):
@@ -327,9 +440,11 @@ async def approve_token_spending(context: CallbackContext, token_contract, spend
             }
             
             approve_tx_dict = token_contract.functions.approve(spender_address, amount_wei).build_transaction(approve_tx_params_for_build)
+            
             logger.debug(f"Built approve_tx_dict for {token_symbol_for_log}: {approve_tx_dict}")
 
             receipt = await asyncio.to_thread(_send_and_wait_for_transaction, approve_tx_dict, f"Approve {token_symbol_for_log}")
+            await asyncio.sleep(13)
             return receipt is not None and receipt.status == 1
         else:
             logger.info(f"Sufficient allowance for {token_symbol_for_log} by {spender_address} already exists.")
@@ -359,7 +474,7 @@ def calculate_ticks_for_range(center_price_human_readable_t0_in_t1: Decimal,
 
     if raw_price_lower_boundary <= 0:
         center_tick_raw = (center_raw_price_t0_per_t1.ln() / TICK_BASE.ln())
-        tick_lower_raw = center_tick_raw - Decimal(tick_spacing * 5) # Arbitrary offset
+        tick_lower_raw = center_tick_raw - Decimal(tick_spacing * 5)
         logger.warning(f"Raw price lower boundary was <=0. Fallback tick_lower_raw: {tick_lower_raw}")
     else:
         tick_lower_raw = (raw_price_lower_boundary.ln() / TICK_BASE.ln())
@@ -413,6 +528,7 @@ async def get_aerodrome_pool_price_and_tick():
         slot0 = await asyncio.to_thread(aerodrome_pool_contract.functions.slot0().call)
         sqrt_price_x96_decimal = Decimal(slot0[0])
         current_tick = slot0[1]
+
         raw_price_t0_per_t1 = (sqrt_price_x96_decimal / (Decimal(2)**96))**2
         
         wblt_decimals_val = 18 # await asyncio.to_thread(wblt_token_contract.functions.decimals().call)
@@ -477,12 +593,10 @@ async def discover_lp_state(context: CallbackContext, wallet_address: str):
                         return int(token_id), "staked"
                     else:
                         logger.info(f"Staked token ID {token_id} (WBLT/USDC) has 0 liquidity. Ignoring.")
-                # else:
-                #     logger.debug(f"Staked token ID {token_id} is not for WBLT/USDC. Token0: {pos_token0}, Token1: {pos_token1}")
-
+                        
             except Exception as e_pos:
                 logger.warning(f"Could not get position details for staked token ID {token_id}: {e_pos}")
-                continue # Try next staked token
+                continue
 
     except Exception as e_staked:
         logger.error(f"Error querying staked values from gauge: {e_staked}", exc_info=True)
@@ -526,9 +640,7 @@ async def discover_lp_state(context: CallbackContext, wallet_address: str):
                         return int(token_id), "unstaked_in_wallet"
                     else:
                         logger.info(f"Wallet token ID {token_id} (WBLT/USDC) has 0 liquidity. Ignoring (likely a burned or empty NFT).")
-                # else:
-                #    logger.debug(f"Wallet token ID {token_id} is not for WBLT/USDC. Token0: {pos_token0}, Token1: {pos_token1}")
-
+                        
             except Exception as e_wallet_pos:
                 logger.warning(f"Could not process wallet token ID {token_id if token_id else f'(index {i})'}: {e_wallet_pos}")
                 continue
@@ -561,14 +673,30 @@ async def get_lp_position_details(context: CallbackContext, nft_id):
         logger.error(f"Error getting LP position details for NFT {nft_id}: {e}")
         return None
 
-async def get_pending_aero_rewards(context: CallbackContext, nft_id):
-    if not nft_id: return Decimal("0")
+async def get_pending_aero_rewards(context: CallbackContext, nft_id_to_check: int):
+    if not nft_id_to_check: return Decimal("0")
     try:
-        earned_wei = await asyncio.to_thread(aerodrome_gauge_contract.functions.earned(BOT_WALLET_ADDRESS, nft_id).call)
+        is_still_staked_by_bot = await asyncio.to_thread(
+            aerodrome_gauge_contract.functions.stakedContains(BOT_WALLET_ADDRESS, nft_id_to_check).call
+        )
+
+        if not is_still_staked_by_bot:
+            logger.info(f"NFT {nft_id_to_check} is not currently staked by {BOT_WALLET_ADDRESS} in gauge {AERODROME_CL_GAUGE_ADDRESS}. Pending AERO assumed to be 0 or claimed.")
+            return Decimal("0")
+
+        earned_wei = await asyncio.to_thread(
+            aerodrome_gauge_contract.functions.earned(BOT_WALLET_ADDRESS, nft_id_to_check).call
+        )
         aero_decimals = await asyncio.to_thread(aero_token_contract.functions.decimals().call)
         return from_wei(earned_wei, aero_decimals)
+    except ContractLogicError as cle:
+        if cle.message and "NA" in cle.message:
+             logger.warning(f"Gauge reverted with 'NA' for NFT {nft_id_to_check} even after stakedContains check (or if check was bypassed). Assuming 0 rewards. Error: {cle}")
+             return Decimal("0")
+        logger.error(f"ContractLogicError getting pending AERO rewards for NFT {nft_id_to_check}: {cle}", exc_info=True)
+        return Decimal("0")
     except Exception as e:
-        logger.error(f"Error getting pending AERO rewards for NFT {nft_id}: {e}")
+        logger.error(f"Error getting pending AERO rewards for NFT {nft_id_to_check}: {e}", exc_info=True)
         return Decimal("0")
 
 # --- KyberSwap ---
@@ -637,7 +765,7 @@ async def execute_kyberswap_swap(context: CallbackContext, token_in_contract, to
         token_in_symbol = await asyncio.to_thread(token_in_contract.functions.symbol().call)
         amount_in_wei_for_route_and_approval = to_wei(amount_in_decimal, token_in_decimals)
 
-        await send_tg_message(context, f"🏗 Fetching KyberSwap route to sell `{amount_in_decimal}` {token_in_symbol} for token `{token_out_address}`...", menu_type=None)
+        await send_tg_message(context, f"🏗 Fetching KyberSwap route to sell `{amount_in_decimal:.4f}` {token_in_symbol} for token `{token_out_address}`...", menu_type=None)
         route_data = await get_kyberswap_swap_route(token_in_contract.address, token_out_address, amount_in_wei_for_route_and_approval)
 
         if not route_data or not route_data.get("routeSummary"):
@@ -653,9 +781,9 @@ async def execute_kyberswap_swap(context: CallbackContext, token_in_contract, to
             await send_tg_message(context, f"Could not build swap data from KyberSwap for {token_in_symbol}.", menu_type=None)
             return False, Decimal("0")
 
-        # --- DEBUG BLOCK ---
+        # --- START DEBUG BLOCK for TRANSFER_FROM_FAILED ---
         api_requested_amount_in_wei_str = swap_build_data.get("amountIn", "0")
-        api_requested_amount_in_wei = int(api_requested_amount_in_wei_str) # amountIn from API is usually a string
+        api_requested_amount_in_wei = int(api_requested_amount_in_wei_str)
 
         logger.info(f"KyberSwap Swap Debug: Intended swap amount (for approval): {amount_in_wei_for_route_and_approval} {token_in_symbol}_wei.")
         logger.info(f"KyberSwap Swap Debug: API route's actual amountIn to be used in tx: {api_requested_amount_in_wei} {token_in_symbol}_wei.")
@@ -673,7 +801,7 @@ async def execute_kyberswap_swap(context: CallbackContext, token_in_contract, to
             await send_tg_message(context, f"Failed to approve {token_in_symbol} for KyberSwap (amount: {amount_in_decimal}).", menu_type=None)
             return False, Decimal("0")
 
-        # swap
+        # Execute the swap
         tx_calldata = swap_build_data["data"]
         tx_value = int(swap_build_data.get("value", "0")) 
 
@@ -687,6 +815,7 @@ async def execute_kyberswap_swap(context: CallbackContext, token_in_contract, to
         
         await send_tg_message(context, f"💸 Executing KyberSwap swap (API expects to use `{from_wei(api_requested_amount_in_wei, token_in_decimals):.{token_in_decimals}f}` {token_in_symbol})...", menu_type=None)
         receipt = await asyncio.to_thread(_send_and_wait_for_transaction, swap_tx_params, f"KyberSwap {token_in_symbol} Swap")
+        await asyncio.sleep(13)
 
         if receipt and receipt.status == 1:
             token_out_decimals = 18 
@@ -706,10 +835,186 @@ async def execute_kyberswap_swap(context: CallbackContext, token_in_contract, to
             return False, Decimal("0")
 
     except Exception as e:
-        logger.error(f"Error in execute_kyberswap_swap: {e}", exc_info=True)
+        logger.error(f"Error in execute_kyberswap_swap: {e}", exc_info=True) # Added exc_info
         await send_tg_message(context, f"Critical error during KyberSwap operation: {e}", menu_type=None)
         return False, Decimal("0")
 
+async def attempt_operation_with_retries(
+    operation_coro,
+    operation_name: str,
+    context: CallbackContext,
+    max_retries: int = 3,
+    delay_seconds: int = 13
+):
+    """
+    Attempts an operation, retrying on failure.
+    operation_coro should be an awaitable that returns a truthy value on success
+    or a specific structure indicating success/failure and any results.
+    For simplicity, let's assume it returns True on success, False on failure for now.
+    Or for swaps, (True, amount_out) or (False, Decimal(0)).
+    """
+    for attempt in range(max_retries + 1):
+        try:
+            logger.info(f"Attempting {operation_name}, attempt {attempt + 1}/{max_retries + 1}...")
+            success, *results = await operation_coro()
+
+            if success:
+                logger.info(f"{operation_name} successful on attempt {attempt + 1}.")
+                return True, results[0] if results else None
+            else:
+                logger.warning(f"{operation_name} failed on attempt {attempt + 1} (returned False).")
+                if attempt < max_retries:
+                    await send_tg_message(context, f"⚠️ {operation_name} failed (attempt {attempt+1}). Retrying in {delay_seconds}s...", menu_type=None)
+                    await asyncio.sleep(delay_seconds)
+                else:
+                    logger.error(f"{operation_name} failed after {max_retries + 1} attempts (returned False).")
+                    await send_tg_message(context, f"❌ {operation_name} FAILED after {max_retries + 1} attempts. Please check logs.", menu_type=None)
+                    return False, results[0] if results else None
+
+        except ContractLogicError as cle:
+            logger.error(f"ContractLogicError during {operation_name} (attempt {attempt + 1}): {cle.message} Data: {cle.data}", exc_info=True)
+            if attempt < max_retries:
+                await send_tg_message(context, f"⚠️ {operation_name} failed with ContractLogicError (attempt {attempt+1}): {str(cle.message)[:50]}. Retrying in {delay_seconds}s...", menu_type=None)
+                await asyncio.sleep(delay_seconds)
+            else:
+                logger.error(f"{operation_name} failed with ContractLogicError after {max_retries + 1} attempts.")
+                await send_tg_message(context, f"❌ {operation_name} FAILED with ContractLogicError after {max_retries + 1} attempts: {str(cle.message)[:50]}. Please check logs.", menu_type=None)
+                return False, None # Indicate failure
+        except Exception as e:
+            logger.error(f"Unexpected error during {operation_name} (attempt {attempt + 1}): {e}", exc_info=True)
+            if attempt < max_retries:
+                await send_tg_message(context, f"⚠️ {operation_name} failed with error (attempt {attempt+1}): {str(e)[:50]}. Retrying in {delay_seconds}s...", menu_type=None)
+                await asyncio.sleep(delay_seconds)
+            else:
+                logger.error(f"{operation_name} failed with error after {max_retries + 1} attempts.")
+                await send_tg_message(context, f"❌ {operation_name} FAILED with error after {max_retries + 1} attempts: {str(e)[:50]}. Please check logs.", menu_type=None)
+                return False, None
+    return False, None
+
+async def _perform_targeted_swap_for_optimal_ratio(
+    context: CallbackContext,
+    current_tick: int, tick_lower: int, tick_upper: int,
+    current_wblt_balance: Decimal, current_usdc_balance: Decimal,
+    wblt_price_in_usdc: Decimal,
+    wblt_decimals_val: int,
+    usdc_decimals_val: int
+) -> tuple[Decimal, Decimal]:
+
+    logger.info(f"Targeted Swap: current_tick={current_tick}, range=[{tick_lower},{tick_upper}], "
+                f"wblt_bal={current_wblt_balance:.8f}, usdc_bal={current_usdc_balance:.8f}, "
+                f"price (USDC/WBLT)={wblt_price_in_usdc:.6f}")
+
+    sqrt_P_current = Decimal("1.0001") ** (Decimal(current_tick) / Decimal(2))
+    sqrt_P_lower   = Decimal("1.0001") ** (Decimal(tick_lower) / Decimal(2))
+    sqrt_P_upper   = Decimal("1.0001") ** (Decimal(tick_upper) / Decimal(2))
+
+    final_wblt = current_wblt_balance
+    final_usdc = current_usdc_balance
+
+    # Case A: Price at or below the lower tick -> Target 100% WBLT
+    if sqrt_P_current <= sqrt_P_lower:
+        logger.info("Targeted Swap: Price at/below range. Aiming for all capital as WBLT.")
+        if current_usdc_balance > MIN_SWAP_THRESHOLD_USDC:
+            await send_tg_message(context, f"Optimal Ratio Swap: Converting all {current_usdc_balance:.2f} USDC to WBLT.", menu_type=None)
+            swap_op = functools.partial(execute_kyberswap_swap, context, usdc_token_contract, WBLT_TOKEN_ADDRESS, current_usdc_balance)
+            success, wblt_gained = await attempt_operation_with_retries(swap_op, "Swap all USDC to WBLT (Optimal Ratio)", context)
+            if success:
+                final_wblt += (wblt_gained if wblt_gained else Decimal(0))
+                final_usdc = Decimal(0) 
+            else:
+                logger.warning("Failed to swap all USDC to WBLT for optimal ratio. Using current balances.")
+        return final_wblt, final_usdc
+
+    # Case B: Price at or above upper tick -> Target 100% USDC
+    elif sqrt_P_current >= sqrt_P_upper:
+        logger.info("Targeted Swap: Price at/above range. Aiming for all capital as USDC.")
+        if current_wblt_balance > MIN_SWAP_THRESHOLD_WBLT:
+            await send_tg_message(context, f"Optimal Ratio Swap: Converting all {current_wblt_balance:.4f} WBLT to USDC.", menu_type=None)
+            swap_op = functools.partial(execute_kyberswap_swap, context, wblt_token_contract, USDC_TOKEN_ADDRESS, current_wblt_balance)
+            success, usdc_gained = await attempt_operation_with_retries(swap_op, "Swap all WBLT to USDC (Optimal Ratio)", context)
+            if success:
+                final_usdc += (usdc_gained if usdc_gained else Decimal(0))
+                final_wblt = Decimal(0)
+            else:
+                logger.warning("Failed to swap all WBLT to USDC for optimal ratio. Using current balances.")
+        return final_wblt, final_usdc
+
+    # Case C: Price within the range
+    else:
+        logger.info("Targeted Swap: Price within range. Calculating ideal token ratio for full capital deployment.")
+        term0_for_L = (Decimal(1) / sqrt_P_current) - (Decimal(1) / sqrt_P_upper)
+        term1_for_L = sqrt_P_current - sqrt_P_lower
+
+        if not (term0_for_L > Decimal('1e-30') and term1_for_L > Decimal('1e-30')):
+            logger.warning(f"Targeted Swap: Terms for L are not both sufficiently positive (term0={term0_for_L}, term1={term1_for_L}). "
+                           "Price might be extremely close to a boundary, effectively one-sided. Skipping targeted swap within Case C.")
+            return final_wblt, final_usdc
+
+        ideal_smallest_unit_ratio_0_to_1 = term0_for_L / term1_for_L
+        logger.info(f"Targeted Swap: Ideal smallest unit ratio (WBLT_wei / USDC_sats_equiv) for range: {ideal_smallest_unit_ratio_0_to_1:.18f}")
+
+        decimal_adjustment_for_human_ratio = Decimal(10)**(wblt_decimals_val - usdc_decimals_val)
+        ideal_human_unit_ratio_wblt_per_usdc = ideal_smallest_unit_ratio_0_to_1 / decimal_adjustment_for_human_ratio
+        logger.info(f"Targeted Swap: Ideal HUMAN unit ratio (WBLT_human / USDC_human) for range: {ideal_human_unit_ratio_wblt_per_usdc:.8f}")
+        total_capital_in_usdc_value = (current_wblt_balance * wblt_price_in_usdc) + current_usdc_balance
+        logger.info(f"Targeted Swap: Total capital value: ${total_capital_in_usdc_value:.2f} (in USDC terms)")        
+        denominator_for_target_usdc = (ideal_human_unit_ratio_wblt_per_usdc * wblt_price_in_usdc) + Decimal(1)
+        
+        if denominator_for_target_usdc.is_zero() or abs(denominator_for_target_usdc) < Decimal('1e-18'):
+             logger.error("Targeted Swap: Denominator for target USDC calculation is zero or too small. Cannot determine target amounts.")
+             return final_wblt, final_usdc
+
+        target_usdc_human_amount = total_capital_in_usdc_value / denominator_for_target_usdc
+        target_wblt_human_amount = ideal_human_unit_ratio_wblt_per_usdc * target_usdc_human_amount
+        
+        logger.info(f"Targeted Swap: Target amounts for full capital deployment: WBLT={target_wblt_human_amount:.8f}, USDC={target_usdc_human_amount:.8f}")
+
+        wblt_to_acquire = target_wblt_human_amount - current_wblt_balance
+        value_of_wblt_to_acquire_in_usdc = wblt_to_acquire * wblt_price_in_usdc
+
+        MIN_SWAP_VALUE_THRESHOLD_USD = Decimal("1.0") 
+
+        if abs(value_of_wblt_to_acquire_in_usdc) < MIN_SWAP_VALUE_THRESHOLD_USD:
+            logger.info(f"Targeted Swap: Difference to target ratio is too small (value ~${abs(value_of_wblt_to_acquire_in_usdc):.2f}). No swap needed.")
+            return final_wblt, final_usdc
+
+        if wblt_to_acquire > Decimal("1e-9"):
+            usdc_to_sell = value_of_wblt_to_acquire_in_usdc
+            usdc_to_sell = min(usdc_to_sell, current_usdc_balance) 
+            
+            if usdc_to_sell > MIN_SWAP_THRESHOLD_USDC:
+                logger.info(f"Targeted Swap: Need ~{wblt_to_acquire:.4f} more WBLT. Selling ~{usdc_to_sell:.2f} USDC.")
+                await send_tg_message(context, f"Optimal Ratio Swap: Selling ~{usdc_to_sell:.2f} USDC for WBLT.", menu_type=None)
+                swap_op = functools.partial(execute_kyberswap_swap, context, usdc_token_contract, WBLT_TOKEN_ADDRESS, usdc_to_sell)
+                success, wblt_gained = await attempt_operation_with_retries(swap_op, "Swap USDC to WBLT (Optimal Ratio)", context)
+                if success:
+                    final_wblt += (wblt_gained if wblt_gained else Decimal(0))
+                    final_usdc -= usdc_to_sell 
+                else:
+                    logger.warning("Failed to swap USDC to WBLT for optimal ratio. Using current balances.")
+            else:
+                logger.info(f"Targeted Swap: Calculated USDC amount to sell ({usdc_to_sell:.2f}) for WBLT is below MIN_SWAP_THRESHOLD_USDC.")
+
+        elif wblt_to_acquire < Decimal("-1e-9"):
+            wblt_to_sell = abs(wblt_to_acquire)
+            wblt_to_sell = min(wblt_to_sell, current_wblt_balance)
+
+            if wblt_to_sell > MIN_SWAP_THRESHOLD_WBLT:
+                logger.info(f"Targeted Swap: Have ~{abs(wblt_to_acquire):.4f} excess WBLT. Selling ~{wblt_to_sell:.4f} WBLT.")
+                await send_tg_message(context, f"Optimal Ratio Swap: Selling ~{wblt_to_sell:.4f} WBLT for USDC.", menu_type=None)
+                swap_op = functools.partial(execute_kyberswap_swap, context, wblt_token_contract, USDC_TOKEN_ADDRESS, wblt_to_sell)
+                success, usdc_gained = await attempt_operation_with_retries(swap_op, "Swap WBLT to USDC (Optimal Ratio)", context)
+                if success:
+                    final_usdc += (usdc_gained if usdc_gained else Decimal(0))
+                    final_wblt -= wblt_to_sell
+                else:
+                    logger.warning("Failed to swap WBLT to USDC for optimal ratio. Using current balances.")
+            else:
+                logger.info(f"Targeted Swap: Calculated WBLT amount to sell ({wblt_to_sell:.4f}) for USDC is below MIN_SWAP_THRESHOLD_WBLT.")
+        else:
+            logger.info("Targeted Swap: Current balances are already effectively at the ideal ratio.")
+            
+        return final_wblt, final_usdc
 
 # --- Telegram Menu ---
 async def get_main_menu_keyboard():
@@ -794,7 +1099,7 @@ async def get_manage_principal_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 
-# --- Telegram Command Handlers (probably not necessary, never actually used these commands in prod) ---
+# --- Telegram Command Handlers ---
 async def start_command(update: Update, context: CallbackContext):
     if update.effective_user.id != TELEGRAM_ADMIN_USER_ID:
         await update.message.reply_text("You are not authorized to use this bot.")
@@ -935,7 +1240,8 @@ async def text_message_handler(update: Update, context: CallbackContext):
         bot_state["is_processing_action"] = False
         await save_state_async()
 
-# --- Action Handler (button_handler) ---
+# --- Action Handler (called by button_handler) ---
+
 async def handle_status_action(context: CallbackContext):
     if not check_connection():
         await send_tg_message(context, "Web3 not connected. Cannot fetch status.")
@@ -945,39 +1251,37 @@ async def handle_status_action(context: CallbackContext):
     
     # Wallet Balances
     eth_balance_wei = await asyncio.to_thread(w3.eth.get_balance, BOT_WALLET_ADDRESS)
-    status_lines.append(f"🔷 ETH Balance: {from_wei(eth_balance_wei, 18):.6f} ETH")
+    status_lines.append(f"🔷 ETH Balance: `{from_wei(eth_balance_wei, 18):.6f}`")
     usdc_bal = await get_token_balance(usdc_token_contract, BOT_WALLET_ADDRESS)
     wblt_bal = await get_token_balance(wblt_token_contract, BOT_WALLET_ADDRESS)
     aero_bal = await get_token_balance(aero_token_contract, BOT_WALLET_ADDRESS)
-    status_lines.append(f"💰 USDC Balance: {usdc_bal:.2f}")
-    status_lines.append(f"🌯 WBLT Balance: {wblt_bal:.4f}")
-    status_lines.append(f"✈️ AERO Balance: {aero_bal:.4f}")
+    status_lines.append(f"💰 USDC Balance: `{usdc_bal:.2f}`")
+    status_lines.append(f"🌯 WBLT Balance: `{wblt_bal:.4f}`")
+    status_lines.append(f"✈️ AERO Balance: `{aero_bal:.4f}`")
     status_lines.append("---")
 
     # LP Position
-    if bot_state["aerodrome_lp_nft_id"]:
-        status_lines.append(f"💰 Aerodrome LP NFT ID: `{bot_state['aerodrome_lp_nft_id']}`")
-        position_details = await get_lp_position_details(context, bot_state["aerodrome_lp_nft_id"])
+    current_nft_id_in_state = bot_state.get("aerodrome_lp_nft_id") # Use .get for safety
+
+    if current_nft_id_in_state:
+        status_lines.append(f"💰 Aerodrome LP NFT ID: `{current_nft_id_in_state}`")
+        position_details = await get_lp_position_details(context, current_nft_id_in_state)
         price_wblt_usdc, current_tick = await get_aerodrome_pool_price_and_tick()
 
         if position_details and price_wblt_usdc is not None and current_tick is not None:
             tick_lower_lp = position_details['tickLower']
             tick_upper_lp = position_details['tickUpper']
 
-            # Convert LP range ticks to human-readable prices
             wblt_decimals_val = await asyncio.to_thread(wblt_token_contract.functions.decimals().call)
             usdc_decimals_val = await asyncio.to_thread(usdc_token_contract.functions.decimals().call)
-            
-            # Price of WBLT in USDC
             decimal_adj_factor_for_price = Decimal(10)**(wblt_decimals_val - usdc_decimals_val)
             
             price_at_tick_lower_lp = (Decimal("1.0001")**Decimal(tick_lower_lp)) * decimal_adj_factor_for_price
             price_at_tick_upper_lp = (Decimal("1.0001")**Decimal(tick_upper_lp)) * decimal_adj_factor_for_price
                         
             status_lines.append(f"  📐 Tick Range: `{tick_lower_lp}` to `{tick_upper_lp}`")
-            status_lines.append(f"  💲 Price Range: `{price_at_tick_lower_lp:.4f}` - `{price_at_tick_upper_lp:.4f} USDC`")
+            status_lines.append(f"  💲 Price Range: `{price_at_tick_lower_lp:.4f}` - `{price_at_tick_upper_lp:.4f} USDC` `({TARGET_RANGE_WIDTH_PERCENTAGE}%)`")
 
-            # --- Calculate and Display Buffer Trigger Prices ---
             actual_tick_span_lp = tick_upper_lp - tick_lower_lp
             lower_trigger_tick_for_status = tick_lower_lp
             upper_trigger_tick_for_status = tick_upper_lp
@@ -988,17 +1292,11 @@ async def handle_status_action(context: CallbackContext):
                     if pool_tick_spacing > 0:
                         raw_buffer_in_ticks = actual_tick_span_lp * (REBALANCE_TRIGGER_BUFFER_PERCENTAGE / Decimal(100))
                         num_tick_spacings_for_buffer = int(Decimal(raw_buffer_in_ticks) / Decimal(pool_tick_spacing))
-
                         if num_tick_spacings_for_buffer == 0 and raw_buffer_in_ticks > 0:
                             num_tick_spacings_for_buffer = 1
-                        
                         buffer_tick_amount_aligned = num_tick_spacings_for_buffer * pool_tick_spacing
-
                         if (2 * buffer_tick_amount_aligned) >= actual_tick_span_lp:
-                            if actual_tick_span_lp > pool_tick_spacing:
-                                buffer_tick_amount_aligned = pool_tick_spacing
-                            else:
-                                buffer_tick_amount_aligned = 0
+                            buffer_tick_amount_aligned = pool_tick_spacing if actual_tick_span_lp > pool_tick_spacing else 0
                         
                         lower_trigger_tick_for_status = tick_lower_lp + buffer_tick_amount_aligned
                         upper_trigger_tick_for_status = tick_upper_lp - buffer_tick_amount_aligned
@@ -1007,7 +1305,7 @@ async def handle_status_action(context: CallbackContext):
                         price_at_upper_trigger = (Decimal("1.0001")**Decimal(upper_trigger_tick_for_status)) * decimal_adj_factor_for_price
                         
                         status_lines.append(
-                            f"  🔔 Rebalance Trigger Prices: `< {price_at_lower_trigger:.4f}` and `> {price_at_upper_trigger:.4f}` "
+                            f"  🔔 Rebalance Triggers: `<{price_at_lower_trigger:.4f}` & `>{price_at_upper_trigger:.4f}` "
                             f"`({REBALANCE_TRIGGER_BUFFER_PERCENTAGE}%)`"
                         )
                     else:
@@ -1021,39 +1319,50 @@ async def handle_status_action(context: CallbackContext):
             status_lines.append(f"  📈 Pool Tick: `{current_tick}`")
             status_lines.append(f"  💵 WBLT Price: `{price_wblt_usdc:.4f} USDC`")
 
+            staked_status_str = "(Unknown)"
+            try:
+                is_staked = await asyncio.to_thread(
+                    aerodrome_gauge_contract.functions.stakedContains(BOT_WALLET_ADDRESS, current_nft_id_in_state).call
+                )
+                staked_status_str = "(Staked)" if is_staked else "(Unstaked)"
+            except Exception as e_staked_check:
+                logger.warning(f"Could not check staked status for NFT {current_nft_id_in_state} in status: {e_staked_check}")
+
             is_in_actual_range = current_tick >= tick_lower_lp and current_tick < tick_upper_lp
             range_status_emoji = "✅ **In Range**" if is_in_actual_range else "❌ **Out of Range**"
+            
             is_within_buffer_zone = current_tick >= lower_trigger_tick_for_status and current_tick < upper_trigger_tick_for_status
             
+            status_line_text = f"  ✨ Status: {range_status_emoji} {staked_status_str}"
+            
             if is_in_actual_range:
-                status_lines.append(f"  ✨ Status: {range_status_emoji}")
                 if not is_within_buffer_zone and actual_tick_span_lp > 0 :
-                     status_lines.append("  ⚠️ Price is near edge, approaching rebalance trigger.")
+                     status_line_text += " (Near Edge)"
             else:
-                status_lines.append(f"  ✨ Status: {range_status_emoji} (Rebalance likely needed/pending)")
-
-
+                status_line_text += " (Rebalance Pending)"
+            status_lines.append(status_line_text)
+            
             status_lines.append(f"  💧 Liquidity (Abstract): `{position_details['liquidity']}`")
 
-            principal_wblt_usd = bot_state["current_lp_principal_wblt_amount"] * price_wblt_usdc
-            total_principal_usd = principal_wblt_usd + bot_state["current_lp_principal_usdc_amount"]
+            principal_wblt_usd_value = bot_state["current_lp_principal_wblt_amount"] * price_wblt_usdc
+            total_principal_usd_value = principal_wblt_usd_value + bot_state["current_lp_principal_usdc_amount"]
             status_lines.append(f"  💼 Principal: `{bot_state['current_lp_principal_wblt_amount']:.4f} WBLT` & `{bot_state['current_lp_principal_usdc_amount']:.2f} USDC`")
-            status_lines.append(f"  💲 Est. Value: `${total_principal_usd:.2f}`")
+            status_lines.append(f"  💲 Est. Value: `${total_principal_usd_value:.2f}`")
 
-            pending_aero = await get_pending_aero_rewards(context, bot_state["aerodrome_lp_nft_id"])
+            pending_aero = await get_pending_aero_rewards(context, current_nft_id_in_state)
             status_lines.append(f"  🎁 Pending AERO: `{pending_aero:.4f} AERO`")
         else:
             status_lines.append("  🤷‍♀️ Could not fetch LP position details or pool price.")
     else:
-        status_lines.append("❌ No active Aerodrome LP position\.")
+        status_lines.append("❌ No active Aerodrome LP position.")
     status_lines.append("---")
 
     status_lines.append(f"🧠 Strategy: `{bot_state['current_strategy']}`")
     profit_value_str = f"{bot_state['accumulated_profit_usdc']:.2f}"
-    status_lines.append(f"💸 Accumulated Profit (Withdrawable): `${profit_value_str}` USDC")
-    status_lines.append(f"🛑 Operations Halted: {'YES' if bot_state['operations_halted'] else 'NO'}")
-    status_lines.append(f"🔒 Action Lock: {'ENGAGED' if bot_state['is_processing_action'] else 'FREE'}")
-    status_lines.append(f"🛠️ Initial Setup Pending: {'YES' if bot_state['initial_setup_pending'] else 'NO'}")
+    status_lines.append(f"💸 Accumulated Profit: `${profit_value_str} USDC`")
+    status_lines.append(f"🛑 Operations Halted: `{'YES' if bot_state['operations_halted'] else 'NO'}`")
+    status_lines.append(f"🔒 Action Lock: `{'ENGAGED' if bot_state.get('is_processing_action', False) else 'FREE'}`")
+    status_lines.append(f"🛠️ Initial Setup Pending: `{'YES' if bot_state.get('initial_setup_pending', True) else 'NO'}`")
 
     bot_state["last_telegram_status_update_time"] = time.time()
     await save_state_async()
@@ -1091,7 +1400,6 @@ async def _execute_profit_withdrawal(context: CallbackContext, amount_decimal: D
         await send_tg_message(context, f"Insufficient profit. Requested: {amount_decimal:.2f}, Available: {bot_state['accumulated_profit_usdc']:.2f} USDC.")
         return
 
-    # Check bot's actual USDC balance
     bot_usdc_balance = await asyncio.to_thread(get_token_balance, usdc_token_contract, BOT_WALLET_ADDRESS)
     if bot_usdc_balance < amount_decimal:
         await send_tg_message(context, f"⚠️ Bot's USDC wallet balance ({bot_usdc_balance:.2f}) is less than requested profit withdrawal ({amount_decimal:.2f}). Manual check needed.")
@@ -1109,7 +1417,7 @@ async def _execute_profit_withdrawal(context: CallbackContext, amount_decimal: D
     transfer_tx = usdc_token_contract.functions.transfer(USER_PROFIT_WITHDRAWAL_ADDRESS, amount_wei).build_transaction(tx_params)
     
     receipt = await asyncio.to_thread(_send_and_wait_for_transaction, transfer_tx, f"Withdraw {amount_decimal:.2f} USDC Profit")
-
+    await asyncio.sleep(13)
     if receipt and receipt.status == 1:
         bot_state["accumulated_profit_usdc"] -= amount_decimal
         await save_state_async()
@@ -1153,11 +1461,10 @@ async def handle_set_initial_lp_nft_id_action(context: CallbackContext, nft_id: 
         if not position_details:
             await send_tg_message(context, f"⚠️ Could not fetch details for NFT ID {nft_id} or it's not a WBLT/USDC pair.")
             return
-      
+                
         bot_state["aerodrome_lp_nft_id"] = nft_id
         bot_state["initial_setup_pending"] = False
         
-        # Now placeholder. potentially replaced by NFT and gauge queries
         await send_tg_message(context, f"✅ LP NFT ID set to {nft_id}. Principal amounts will be accurately set after the next rebalance. Current tracked principals might be approximate.")
         
         bot_state["current_lp_principal_wblt_amount"] = Decimal("0")
@@ -1187,18 +1494,31 @@ async def process_full_rebalance(context: CallbackContext, triggered_by="auto"):
     try:
         # 1. Unstake LP from Gauge (if an LP exists)
         if original_nft_id:
-            await send_tg_message(context, f"Unstaking LP NFT `{original_nft_id}` from gauge...", menu_type=None)
-            unstake_tx_params = {'from': BOT_WALLET_ADDRESS, 'nonce': get_nonce()}
-            unstake_tx_params['chainId'] = await asyncio.to_thread(lambda: w3.eth.chain_id)
-            unstake_tx = aerodrome_gauge_contract.functions.withdraw(original_nft_id).build_transaction(unstake_tx_params)
-            unstake_receipt = await asyncio.to_thread(_send_and_wait_for_transaction, unstake_tx, f"Unstake LP NFT {original_nft_id}")
-            if not (unstake_receipt and unstake_receipt.status == 1):
-                await send_tg_message(context, f"⚠️ Failed to unstake LP NFT {original_nft_id}. Rebalance aborted.", menu_type=None)
-                return 
-            await send_tg_message(context, f"✅ LP NFT {original_nft_id} unstaked.", menu_type=None)
-            bot_state["last_aero_claim_time"] = time.time()
+            is_staked_check = False
+            try:
+                is_staked_check = await asyncio.to_thread(
+                    aerodrome_gauge_contract.functions.stakedContains(BOT_WALLET_ADDRESS, original_nft_id).call
+                )
+            except Exception as e_staked_check:
+                logger.warning(f"Could not check if NFT {original_nft_id} is staked: {e_staked_check}. Assuming not staked for safety.")
+            
+            if is_staked_check:
+                await send_tg_message(context, f"Unstaking LP NFT `{original_nft_id}` from gauge...", menu_type=None)
+                unstake_tx_params = {'from': BOT_WALLET_ADDRESS}
+                unstake_tx = aerodrome_gauge_contract.functions.withdraw(original_nft_id).build_transaction(unstake_tx_params)
+                unstake_receipt = await asyncio.to_thread(_send_and_wait_for_transaction, unstake_tx, f"Unstake LP NFT {original_nft_id}")
+                
+                if not (unstake_receipt and unstake_receipt.status == 1):
+                    await send_tg_message(context, f"⚠️ Failed to unstake LP NFT {original_nft_id}. Rebalance aborted.", menu_type=None)
+                    return 
+                await send_tg_message(context, f"✅ LP NFT {original_nft_id} unstaked.", menu_type=None)
+                bot_state["last_aero_claim_time"] = time.time()
+                await asyncio.sleep(13)
+            else:
+                logger.info(f"NFT {original_nft_id} found in state, but not currently staked in gauge. Skipping unstake step.")
+                await send_tg_message(context, f"ℹ️ NFT {original_nft_id} is already in wallet (not staked). Proceeding to withdraw liquidity.", menu_type=None)
         else:
-            logger.info("No existing LP NFT to unstake. Proceeding with available wallet funds.")
+            logger.info("No existing LP NFT ID in state. Proceeding with available wallet funds.")
             await send_tg_message(context, "No existing LP NFT found. Will use wallet funds for new position.", menu_type=None)
 
         # 2. Withdraw Liquidity from Aerodrome LP (if an LP was unstaked)
@@ -1210,18 +1530,19 @@ async def process_full_rebalance(context: CallbackContext, triggered_by="auto"):
                     'tokenId': original_nft_id, 'liquidity': position_details['liquidity'],
                     'amount0Min': 0, 'amount1Min': 0, 'deadline': int(time.time()) + 600 
                 }
-                decrease_tx_params = {'from': BOT_WALLET_ADDRESS, 'nonce': get_nonce(), 'chainId': await asyncio.to_thread(lambda: w3.eth.chain_id)}
+                decrease_tx_params = {'from': BOT_WALLET_ADDRESS}
                 decrease_tx = aerodrome_nft_manager_contract.functions.decreaseLiquidity(decrease_params).build_transaction(decrease_tx_params)
                 decrease_receipt = await asyncio.to_thread(_send_and_wait_for_transaction, decrease_tx, f"Decrease Liquidity NFT {original_nft_id}")
-
+                await asyncio.sleep(13)
                 if decrease_receipt and decrease_receipt.status == 1:
                     collect_params = {
                         'tokenId': original_nft_id, 'recipient': BOT_WALLET_ADDRESS,
                         'amount0Max': 2**128 - 1, 'amount1Max': 2**128 - 1
                     }
-                    collect_tx_params = {'from': BOT_WALLET_ADDRESS, 'nonce': get_nonce(), 'chainId': await asyncio.to_thread(lambda: w3.eth.chain_id)}
+                    collect_tx_params = {'from': BOT_WALLET_ADDRESS}
                     collect_tx = aerodrome_nft_manager_contract.functions.collect(collect_params).build_transaction(collect_tx_params)
                     collect_receipt_obj = await asyncio.to_thread(_send_and_wait_for_transaction, collect_tx, f"Collect Tokens NFT {original_nft_id}")
+                    await asyncio.sleep(13)
                     if collect_receipt_obj and collect_receipt_obj.status == 1:
                         await send_tg_message(context, "✅ Liquidity withdrawn and tokens collected.", menu_type=None)
                     else:
@@ -1233,9 +1554,10 @@ async def process_full_rebalance(context: CallbackContext, triggered_by="auto"):
                 final_pos_details = await get_lp_position_details(context, original_nft_id)
                 if final_pos_details and final_pos_details['liquidity'] == 0:
                     await send_tg_message(context, f"Burning empty LP NFT {original_nft_id}...", menu_type=None)
-                    burn_tx_params = {'from': BOT_WALLET_ADDRESS, 'nonce': get_nonce(), 'chainId': await asyncio.to_thread(lambda: w3.eth.chain_id)}
+                    burn_tx_params = {'from': BOT_WALLET_ADDRESS}
                     burn_tx = aerodrome_nft_manager_contract.functions.burn(original_nft_id).build_transaction(burn_tx_params)
                     await asyncio.to_thread(_send_and_wait_for_transaction, burn_tx, f"Burn LP NFT {original_nft_id}")
+                    await asyncio.sleep(13)
             else:
                 await send_tg_message(context, f"No active liquidity in LP NFT {original_nft_id} to withdraw.", menu_type=None)
             bot_state["aerodrome_lp_nft_id"] = None
@@ -1247,12 +1569,15 @@ async def process_full_rebalance(context: CallbackContext, triggered_by="auto"):
         logger.info(f"Consolidated Funds - WBLT: {available_wblt}, USDC: {available_usdc}, AERO: {available_aero}")
 
         # 4. Sell ALL AERO
-        usdc_from_aero_sale = Decimal("0")
-        if available_aero > Decimal("0.00001"):
-            await send_tg_message(context, f"Selling {available_aero:.6f} AERO for USDC...", menu_type=None)
-            swap_success, usdc_received = await execute_kyberswap_swap(context, aero_token_contract, USDC_TOKEN_ADDRESS, available_aero)
+        if available_aero > Decimal("1.0"): # Sensible threshold
+            await send_tg_message(context, f"Attempting to sell {available_aero:.6f} AERO for USDC...", menu_type=None)
+            swap_aero_op = functools.partial(execute_kyberswap_swap, context, aero_token_contract, USDC_TOKEN_ADDRESS, available_aero)
+            swap_success, usdc_amount_from_aero = await attempt_operation_with_retries(
+                swap_aero_op, "Sell AERO via KyberSwap", context
+            )
+            await asyncio.sleep(13)
             if swap_success:
-                usdc_from_aero_sale = usdc_received
+                usdc_from_aero_sale = usdc_amount_from_aero if usdc_amount_from_aero else Decimal("0")
                 available_usdc += usdc_from_aero_sale
                 if bot_state["current_strategy"] == "take_profit":
                     bot_state["accumulated_profit_usdc"] += usdc_from_aero_sale
@@ -1260,15 +1585,15 @@ async def process_full_rebalance(context: CallbackContext, triggered_by="auto"):
                 else:
                     await send_tg_message(context, f"✅ AERO sold. {usdc_from_aero_sale:.2f} USDC to be compounded.", menu_type=None)
             else:
-                await send_tg_message(context, "⚠️ Failed to sell AERO.", menu_type=None)
+                await send_tg_message(context, "⚠️ Failed to sell AERO after retries. Continuing rebalance with current funds.", menu_type=None)
+        logger.info(f"Funds after AERO sale - WBLT: {available_wblt}, USDC: {available_usdc}")
         
         # 5. Determine New Optimal LP Range
-        price_from_this_pool, pool_current_tick_for_logging = await get_aerodrome_pool_price_and_tick()
-        if price_from_this_pool is None:
-            await send_tg_message(context, "❌ Cannot get current pool price. Rebalance aborted.", menu_type=None)
+        price_wblt_human_for_range, pool_current_tick = await get_aerodrome_pool_price_and_tick()
+        if price_wblt_human_for_range is None or pool_current_tick is None:
+            await send_tg_message(context, "❌ Cannot get current pool price/tick. Rebalance aborted.", menu_type=None)
             return
-        center_price_for_range_calc = price_from_this_pool
-        logger.info(f"Centering new LP range around pool price: ${center_price_for_range_calc:.6f} (tick {pool_current_tick_for_logging})")
+        logger.info(f"Centering new LP range around pool price: ${price_wblt_human_for_range:.6f} (tick {pool_current_tick})")
 
         tick_spacing = await asyncio.to_thread(aerodrome_pool_contract.functions.tickSpacing().call)
         logger.info(f"Pool {AERODROME_CL_POOL_ADDRESS} uses tickSpacing: {tick_spacing}")
@@ -1276,12 +1601,9 @@ async def process_full_rebalance(context: CallbackContext, triggered_by="auto"):
         current_target_range_width = TARGET_RANGE_WIDTH_PERCENTAGE
         logger.info(f"Using target range width: {current_target_range_width}% for this mint attempt.")
 
-        wblt_decimals_val = await asyncio.to_thread(wblt_token_contract.functions.decimals().call)
-        usdc_decimals_val = await asyncio.to_thread(usdc_token_contract.functions.decimals().call)
-
         new_tick_lower, new_tick_upper = await asyncio.to_thread(
             calculate_ticks_for_range,
-            center_price_for_range_calc,
+            price_wblt_human_for_range,
             current_target_range_width,
             tick_spacing,
             wblt_decimals_val,
@@ -1290,184 +1612,110 @@ async def process_full_rebalance(context: CallbackContext, triggered_by="auto"):
         logger.info(f"Calculated new LP ticks using calculate_ticks_for_range: Lower={new_tick_lower}, Upper={new_tick_upper}")
         await send_tg_message(context, f"New target LP range: Ticks `[{new_tick_lower}, {new_tick_upper}]`.", menu_type=None)
 
-        # 6. & 7. Rebalance WBLT/USDC for ~50/50 USD Value
-        price_to_use_for_rebalance = center_price_for_range_calc 
-        total_value_usd = (available_wblt * price_to_use_for_rebalance) + available_usdc
-        if total_value_usd > Decimal("0"):
-            target_usdc_value_for_each_token = total_value_usd / Decimal("2")
-            if price_to_use_for_rebalance == Decimal(0):
-                await send_tg_message(context, "❌ Price for rebalancing is zero. Aborting.", menu_type=None)
-                return
-            wblt_target_amount = target_usdc_value_for_each_token / price_to_use_for_rebalance
-            amount_to_swap = Decimal("0")
-            swap_wblt_to_usdc = False
-            swap_usdc_to_wblt = False
+        # 6. Determine final WBLT & USDC amounts for mint by targeting optimal ratio for ALL capital
+        logger.info("Performing targeted swap (if needed) to optimize token ratio for the chosen LP range using all available capital...")
+        swapped_wblt, swapped_usdc = await _perform_targeted_swap_for_optimal_ratio(
+            context,
+            pool_current_tick, new_tick_lower, new_tick_upper,
+            available_wblt, available_usdc, 
+            price_wblt_human_for_range,
+            wblt_decimals_val,
+            usdc_decimals_val
+        )
+        logger.info(f"Balances after targeted swap: WBLT={swapped_wblt:.8f}, USDC={swapped_usdc:.8f}")
+        await asyncio.sleep(13)
 
-            if available_wblt > wblt_target_amount: 
-                amount_to_swap = available_wblt - wblt_target_amount
-                swap_wblt_to_usdc = True
-            elif available_wblt < wblt_target_amount: 
-                usdc_to_spend_on_wblt = (wblt_target_amount - available_wblt) * price_to_use_for_rebalance
-                if usdc_to_spend_on_wblt > Decimal("0") and usdc_to_spend_on_wblt <= available_usdc : 
-                    amount_to_swap = usdc_to_spend_on_wblt 
-                    swap_usdc_to_wblt = True
-            
-            if swap_wblt_to_usdc and amount_to_swap > Decimal("0.00001"):
-                await send_tg_message(context, f"🌀 Rebalancing: Selling ~**{amount_to_swap:.4f} WBLT**.", menu_type=None)
-                success, usdc_gained = await execute_kyberswap_swap(context, wblt_token_contract, USDC_TOKEN_ADDRESS, amount_to_swap)
-                if success: available_wblt -= amount_to_swap; available_usdc += usdc_gained
-            elif swap_usdc_to_wblt and amount_to_swap > Decimal("0.01"):
-                await send_tg_message(context, f"🌀 Rebalancing: Buying WBLT with ~**{amount_to_swap:.2f} USDC**.", menu_type=None)
-                success, wblt_gained = await execute_kyberswap_swap(context, usdc_token_contract, WBLT_TOKEN_ADDRESS, amount_to_swap)
-                if success: available_usdc -= amount_to_swap; available_wblt += wblt_gained
-        logger.info(f"Funds after rebalancing swaps - WBLT: {available_wblt}, USDC: {available_usdc}")
+        desired_wblt_wei = to_wei(swapped_wblt, wblt_decimals_val)
+        desired_usdc_wei = to_wei(swapped_usdc, usdc_decimals_val)
+        
+        logger.info(f"Final desired amounts for mint (from targeted swap): WBLT_wei={desired_wblt_wei}, USDC_wei={desired_usdc_wei}")
+        # For logging, use the already human-readable swapped_wblt and swapped_usdc
+        log_desired_wblt_human = swapped_wblt
+        log_desired_usdc_human = swapped_usdc
 
-        # 8. Deposit Liquidity into New Range on Aerodrome
-        if available_wblt <= Decimal("0.01") and available_usdc <= Decimal("0.01"):
-            await send_tg_message(context, "❌ Insufficient WBLT or USDC available to deposit after rebalancing. Aborting mint.", menu_type=None)
-            logger.warning("Mint aborted: available WBLT and USDC are zero or dust.")
+        # 7. Deposit Liquidity (Mint)
+        min_deposit_value_usd = Decimal("1.0")
+        
+        value_of_desired_wblt = log_desired_wblt_human * price_wblt_human_for_range
+        value_of_desired_usdc = log_desired_usdc_human
+        total_desired_value_for_mint = value_of_desired_wblt + value_of_desired_usdc
+
+        if total_desired_value_for_mint < min_deposit_value_usd:
+            await send_tg_message(context, f"❌ Value of assets intended for mint (${total_desired_value_for_mint:.2f}) is below threshold (${min_deposit_value_usd:.2f}). Aborting mint.", menu_type=None)
+            logger.warning(f"Mint aborted: value of assets for mint ${total_desired_value_for_mint:.2f} is too low. WBLT: {log_desired_wblt_human}, USDC: {log_desired_usdc_human}")
             return
 
-        await send_tg_message(context, f"🏗 Preparing to mint new LP with up to **{available_wblt:.{wblt_decimals_val}f} WBLT** and **{available_usdc:.{usdc_decimals_val}f} USDC**...", menu_type=None)
-        logger.info(f"Preparing to mint. Max Available WBLT: {available_wblt}, Max Available USDC: {available_usdc}")
-
-        # Approvals
-        if available_wblt > Decimal("0"):
-            approved_wblt = await approve_token_spending(context, wblt_token_contract, AERODROME_SLIPSTREAM_NFT_MANAGER_ADDRESS, available_wblt)
-            if approved_wblt: 
-                logger.info("WBLT approval successful or already sufficient.")
-            else:
-                await send_tg_message(context, "❌ Failed to approve WBLT for NFT Manager. Minting aborted.", menu_type=None)
+        await send_tg_message(context, f"🏗 Preparing to mint new LP with: ~**{log_desired_wblt_human:.4f} WBLT** and ~**{log_desired_usdc_human:.2f} USDC**...", menu_type=None)
+        
+        # Approvals for the calculated desired amounts
+        if desired_wblt_wei > 0:
+            approve_wblt_amount_dec_buffered = log_desired_wblt_human * Decimal("1.001") 
+            approved_wblt = await approve_token_spending(context, wblt_token_contract, AERODROME_SLIPSTREAM_NFT_MANAGER_ADDRESS, approve_wblt_amount_dec_buffered)
+            if not approved_wblt:
+                logger.error("WBLT approval failed. Minting aborted.")
                 return
+            logger.info("WBLT approval for optimal amount successful or already sufficient.")
         
-        if available_usdc > Decimal("0"):
-            approved_usdc = await approve_token_spending(context, usdc_token_contract, AERODROME_SLIPSTREAM_NFT_MANAGER_ADDRESS, available_usdc)
-            if approved_usdc:
-                logger.info("USDC approval successful or already sufficient.")
-            else:
-                await send_tg_message(context, "❌ Failed to approve USDC for NFT Manager. Minting aborted.", menu_type=None)
+        if desired_usdc_wei > 0:
+            approve_usdc_amount_dec_buffered = log_desired_usdc_human * Decimal("1.001")
+            approved_usdc = await approve_token_spending(context, usdc_token_contract, AERODROME_SLIPSTREAM_NFT_MANAGER_ADDRESS, approve_usdc_amount_dec_buffered)
+            if not approved_usdc:
+                logger.error("USDC approval failed. Minting aborted.")
                 return
-        
-        slot0_data = await asyncio.to_thread(aerodrome_pool_contract.functions.slot0().call)
-        current_pool_sqrt_price_x96_for_context = slot0_data[0] # For logging or other logic
+            logger.info("USDC approval for optimal amount successful or already sufficient.")
 
-        # --- Amounts for Mint ---
-        # Provide the MAX available amounts. The contract will take what's needed for the range.
-        desired_wblt_wei = to_wei(available_wblt, wblt_decimals_val)
-        desired_usdc_wei = to_wei(available_usdc, usdc_decimals_val)
-
-        current_slippage_bps_for_min = 200 # Or SLIPPAGE_BPS from your config
-        slippage_factor = Decimal(1) - (Decimal(current_slippage_bps_for_min) / Decimal(10000))
-        
-        amount0_min_wei = 0 # Or 1 if you want to ensure at least a symbolic amount if token0 is used
-        amount1_min_wei = 0 # Or 1 if you want to ensure at least a symbolic amount if token1 is used
-        logger.info(f"Using amount0Desired={desired_wblt_wei}, amount1Desired={desired_usdc_wei}")
-        logger.info(f"REVISED: Using amount0Min={amount0_min_wei}, amount1Min={amount1_min_wei} for mint flexibility.")
-
+        # Mint parameters
+        amount0_min_wei = 0 
+        amount1_min_wei = 0
         sqrt_price_x96_limit_for_mint = 0
-        # current_pool_sqrt_price_x96_for_context is still useful for logging
 
-        mint_params_dict_for_log = {
-            "token0": WBLT_TOKEN_ADDRESS, "token1": USDC_TOKEN_ADDRESS,
-            "tickSpacing_actual_param": tick_spacing,
-            "tickLower": new_tick_lower, "tickUpper": new_tick_upper,
-            "amount0Desired": desired_wblt_wei,
-            "amount1Desired": desired_usdc_wei,
-            "amount0Min": amount0_min_wei,
-            "amount1Min": amount1_min_wei,
-            "recipient": BOT_WALLET_ADDRESS, "deadline": int(time.time()) + 600,
-            "sqrtPriceX96Limit_actual_param": sqrt_price_x96_limit_for_mint,
-        }
-        logger.info(f"Attempting to mint with contextual params (for logging): {mint_params_dict_for_log}")
+        mint_params_as_tuple = (
+            Web3.to_checksum_address(WBLT_TOKEN_ADDRESS), Web3.to_checksum_address(USDC_TOKEN_ADDRESS),
+            int(tick_spacing), int(new_tick_lower), int(new_tick_upper),
+            int(desired_wblt_wei), int(desired_usdc_wei),
+            int(amount0_min_wei), int(amount1_min_wei),
+            Web3.to_checksum_address(BOT_WALLET_ADDRESS), int(time.time()) + 600,
+            int(sqrt_price_x96_limit_for_mint)
+        )
+        logger.info(f"Attempting to mint with 12-ELEMENT params tuple (optimal amounts): {mint_params_as_tuple}")
 
         mint_receipt = None
-        estimated_gas_for_mint = None
-        encoded_mint_data = None
-
         try:
             if aerodrome_nft_manager_contract is None:
-                logger.critical("CRITICAL: aerodrome_nft_manager_contract is None! ABI likely failed to load.")
+                logger.critical("CRITICAL during mint: aerodrome_nft_manager_contract is None!")
                 await send_tg_message(context, "❌ CRITICAL ERROR: NFT Manager contract not loaded. Aborting mint.", menu_type=None)
                 return
 
-            # Construct the 12-element tuple matching the ABI's MintParams struct
-            mint_params_as_tuple = (
-                Web3.to_checksum_address(WBLT_TOKEN_ADDRESS),
-                Web3.to_checksum_address(USDC_TOKEN_ADDRESS),
-                int(tick_spacing),
-                int(new_tick_lower),
-                int(new_tick_upper),
-                int(desired_wblt_wei),
-                int(desired_usdc_wei),
-                int(amount0_min_wei),
-                int(amount1_min_wei),
-                Web3.to_checksum_address(BOT_WALLET_ADDRESS),
-                int(time.time()) + 600,
-                int(sqrt_price_x96_limit_for_mint)
-            )
-            logger.info(f"Attempting to mint with 12-ELEMENT params tuple (for encoding): {mint_params_as_tuple}")
-
-            prepared_mint_function_call = aerodrome_nft_manager_contract.functions.mint(
-                mint_params_as_tuple 
-            )
+            prepared_mint_function_call = aerodrome_nft_manager_contract.functions.mint(mint_params_as_tuple)
             encoded_mint_data = prepared_mint_function_call._encode_transaction_data()
-
-            logger.info(f"Encoded mint data (using 12-element tuple): {encoded_mint_data[:120]}...")
-
             tx_for_estimation_or_call = {
-                'from': BOT_WALLET_ADDRESS,
-                'to': AERODROME_SLIPSTREAM_NFT_MANAGER_ADDRESS,
+                'from': BOT_WALLET_ADDRESS, 'to': AERODROME_SLIPSTREAM_NFT_MANAGER_ADDRESS,
                 'data': encoded_mint_data,
             }
-            logger.info(f"Transaction dict for eth_call/estimate_gas: {tx_for_estimation_or_call}")
 
-            # --- STATIC CALL TEST (w3.eth.call) ---
-            try:
-                logger.warning("Attempting static call (w3.eth.call) for mint...")
-                call_result_raw = await asyncio.to_thread(w3.eth.call, tx_for_estimation_or_call, 'latest')
-                logger.info(f"Static call for mint SUCCEEDED. Result (hex): {call_result_raw.hex() if isinstance(call_result_raw, bytes) else call_result_raw}")
-            except ContractLogicError as cle_call:
-                logger.error(f"Static call (w3.eth.call) for mint FAILED. Message: {getattr(cle_call, 'message', str(cle_call))} Data: {getattr(cle_call, 'data', 'N/A')}", exc_info=True)
-                await send_tg_message(context, f"❌ Minting failed (Static Call Reverted): {getattr(cle_call, 'message', str(cle_call))}", menu_type=None)
-                return
-            except Exception as e_call:
-                logger.error(f"Unexpected error during static call (w3.eth.call) for mint: {e_call}", exc_info=True)
-                await send_tg_message(context, f"❌ Minting failed (Static Call Unexpected Error): {e_call}", menu_type=None)
-                return
-            # --- END STATIC CALL TEST ---
+            logger.warning("Attempting static call (w3.eth.call) for mint with optimal amounts...")
+            await asyncio.to_thread(w3.eth.call, tx_for_estimation_or_call, 'latest')
+            logger.info("Static call for mint with optimal amounts SUCCEEDED (or did not revert).")
 
-            logger.info(f"Estimating gas for mint with tx_dict: {tx_for_estimation_or_call}")
-            estimated_gas_for_mint = await asyncio.to_thread(w3.eth.estimate_gas, tx_for_estimation_or_call)
-            logger.info(f"Successfully estimated gas for mint: {estimated_gas_for_mint}")
-
-            final_mint_tx_params_to_send = {
-                'from': BOT_WALLET_ADDRESS,
-                'to': AERODROME_SLIPSTREAM_NFT_MANAGER_ADDRESS,
-                'data': encoded_mint_data,
-                'nonce': await asyncio.to_thread(get_nonce),
-                'gas': estimated_gas_for_mint,
-                'chainId': await asyncio.to_thread(lambda: w3.eth.chain_id)
-            }
-
-            logger.info(f"Transaction ready to be sent for mint: {final_mint_tx_params_to_send}")
-            mint_receipt = await asyncio.to_thread(_send_and_wait_for_transaction, final_mint_tx_params_to_send, "Mint New Aerodrome LP")
-
-        except AttributeError as ae: 
-            logger.error(f"AttributeError during mint prep: {ae}", exc_info=True)
-            await send_tg_message(context, f"❌ Minting failed (AttributeError during prep): {ae}", menu_type=None)
+            final_mint_tx_params_to_send = tx_for_estimation_or_call 
+            mint_receipt = await asyncio.to_thread(
+                 _send_and_wait_for_transaction,
+                 final_mint_tx_params_to_send,
+                 "Mint New Aerodrome LP (Optimal Amts)"
+            )
+            await asyncio.sleep(13)
+            
+        except ContractLogicError as cle:
+            logger.error(f"ContractLogicError during mint (optimal amounts) prep/static call: {getattr(cle, 'message', str(cle))}", exc_info=True)
+            await send_tg_message(context, f"❌ Minting FAILED (Optimal Amts - Contract Revert during Prep): {getattr(cle, 'message', str(cle))}", menu_type=None)
             return
-        except ContractLogicError as cle: 
-            logger.error(f"ContractLogicError during mint prep (estimate_gas likely): Message: {getattr(cle, 'message', str(cle))} Data: {getattr(cle, 'data', 'N/A')}", exc_info=True)
-            await send_tg_message(context, f"❌ Minting failed (ContractLogicError during prep): {getattr(cle, 'message', str(cle))}", menu_type=None)
-            return 
         except Exception as e:
-            logger.error(f"Unexpected error during mint prep: {e}", exc_info=True)
-            await send_tg_message(context, f"❌ Minting failed unexpectedly during prep: {e}", menu_type=None)
+            logger.error(f"Unexpected error during mint (optimal amounts) preparation: {e}", exc_info=True)
+            await send_tg_message(context, f"❌ Minting failed unexpectedly (Optimal Amts - Prep): {e}", menu_type=None)
             return
-        
-        # --- Check mint_receipt and proceed with event parsing, state update, staking ---
+
         if not (mint_receipt and mint_receipt.status == 1):
-            await send_tg_message(context, "❌ Minting new LP position transaction failed or was not confirmed.", menu_type=None)
+            await send_tg_message(context, "❌ Minting new LP (Optimal Amts) transaction FAILED or was not confirmed after retries.", menu_type=None)
             return
         
         new_nft_id = None
@@ -1477,12 +1725,12 @@ async def process_full_rebalance(context: CallbackContext, triggered_by="auto"):
         for log_entry in mint_receipt.get('logs', []):
             if log_entry['address'] == AERODROME_SLIPSTREAM_NFT_MANAGER_ADDRESS and \
                 len(log_entry['topics']) == 4 and log_entry['topics'][0].hex() == erc721_transfer_event_signature:
-                if int(log_entry['topics'][1].hex(), 16) == 0:
+                if int(log_entry['topics'][1].hex(), 16) == 0: # Mint event (from address(0))
                     to_address_str = "0x" + log_entry['topics'][2].hex()[-40:]
                     if Web3.to_checksum_address(to_address_str) == BOT_WALLET_ADDRESS:
                         new_nft_id = w3.to_int(hexstr=log_entry['topics'][3].hex())
                         logger.info(f"Found Transfer event for new NFT ID: {new_nft_id} to bot wallet.")
-                        break 
+                        break
         if new_nft_id is None:
             await send_tg_message(context, "❌ Could not find new LP NFT ID from mint events. Manual check needed.", menu_type=None)
             return
@@ -1506,27 +1754,27 @@ async def process_full_rebalance(context: CallbackContext, triggered_by="auto"):
         if not found_increase_liquidity_event:
             await send_tg_message(context, f"⚠️ Could not parse IncreaseLiquidity event for NFT {new_nft_id}. Principals may be inaccurate.", menu_type=None)
 
-        # 9. Update Principal & State
+        # 8. Update Principal & State
         bot_state["aerodrome_lp_nft_id"] = new_nft_id
         bot_state["current_lp_principal_wblt_amount"] = from_wei(actual_wblt_deposited_wei, wblt_decimals_val)
         bot_state["current_lp_principal_usdc_amount"] = from_wei(actual_usdc_deposited_wei, usdc_decimals_val)
         bot_state["initial_setup_pending"] = False 
         logger.info(f"Updated LP Principal: {bot_state['current_lp_principal_wblt_amount']:.{wblt_decimals_val}f} WBLT, {bot_state['current_lp_principal_usdc_amount']:.{usdc_decimals_val}f} USDC from mint of NFT {new_nft_id}.")
-        
-        # 10. Stake New LP NFT
+
+        # 9. Stake New LP NFT
         await send_tg_message(context, f"ℹ️ Staking new LP NFT `{new_nft_id}`...", menu_type=None)
         approved_nft_for_gauge = await approve_nft_for_spending(context, aerodrome_nft_manager_contract, AERODROME_CL_GAUGE_ADDRESS, new_nft_id)
+        await asyncio.sleep(13)
         if not approved_nft_for_gauge:
+            logger.error(f"Failed to approve NFT {new_nft_id} for staking. Staking aborted.")
             await send_tg_message(context, f"❌ Failed to approve NFT {new_nft_id} for staking. Staking aborted.", menu_type=None)
+            return
         else:
             await send_tg_message(context, f"✅ NFT {new_nft_id} approved. Staking...", menu_type=None)
-            stake_receipt = None 
-            deposit_function_call = aerodrome_gauge_contract.functions.deposit(new_nft_id)
-            base_stake_tx_params = {'from': BOT_WALLET_ADDRESS, 'chainId': await asyncio.to_thread(lambda: w3.eth.chain_id), 'nonce': get_nonce()}
-            try:
-                stake_tx_dict = deposit_function_call.build_transaction(base_stake_tx_params)
-                stake_receipt = await asyncio.to_thread(_send_and_wait_for_transaction, stake_tx_dict, f"Stake LP NFT {new_nft_id}")
-            except Exception as e: logger.error(f"Error during STAKE of NFT {new_nft_id}: {e}", exc_info=True)
+            stake_tx_params = {'from': BOT_WALLET_ADDRESS}
+            stake_tx = aerodrome_gauge_contract.functions.deposit(new_nft_id).build_transaction(stake_tx_params)
+            stake_receipt = await asyncio.to_thread(_send_and_wait_for_transaction, stake_tx, f"Stake LP NFT {new_nft_id}")
+            await asyncio.sleep(13)
             if not (stake_receipt and stake_receipt.status == 1):
                 await send_tg_message(context, f"⚠️ Failed to stake LP NFT {new_nft_id}. Remains in wallet.", menu_type=None)
             else:
@@ -1555,7 +1803,7 @@ async def process_claim_sell_aero(context: CallbackContext, triggered_by="auto")
         nft_id_to_claim = bot_state["aerodrome_lp_nft_id"]
         pending_aero_before_claim = await get_pending_aero_rewards(context, nft_id_to_claim)
         
-        if pending_aero_before_claim < Decimal("0.1"): # Small threshold, effectively zero, USD 0.06 at current prices
+        if pending_aero_before_claim < Decimal("1.0"):
             await send_tg_message(context, "No significant AERO rewards to claim.", menu_type=None)
             bot_state["last_aero_claim_time"] = time.time()
             await save_state_async()
@@ -1565,7 +1813,7 @@ async def process_claim_sell_aero(context: CallbackContext, triggered_by="auto")
         claim_tx_params = {'from': BOT_WALLET_ADDRESS, 'nonce': get_nonce()}
         claim_tx = aerodrome_gauge_contract.functions.getReward(nft_id_to_claim).build_transaction(claim_tx_params)
         claim_receipt = await asyncio.to_thread(_send_and_wait_for_transaction, claim_tx, f"Claim AERO for NFT {nft_id_to_claim}")
-
+        await asyncio.sleep(13)
         if not (claim_receipt and claim_receipt.status == 1):
             await send_tg_message(context, "❌ AERO claim transaction failed or not confirmed.", menu_type=None)
             return
@@ -1576,21 +1824,28 @@ async def process_claim_sell_aero(context: CallbackContext, triggered_by="auto")
         # 2. Get bot's AERO balance (should include newly claimed AERO)
         aero_balance = await get_token_balance(aero_token_contract, BOT_WALLET_ADDRESS)
         
-        if aero_balance < Decimal("0.01"): # Small threshold, effectively zero, USD 0.06 at current prices
-            await send_tg_message(context, "No AERO in wallet to sell after claim attempt.", menu_type=None)
+        if aero_balance < Decimal("1.0"):
+            await send_tg_message(context, "No significant AERO in wallet to sell after claim attempt.", menu_type=None)
             await save_state_async()
             return
 
         # 3. Sell ALL AERO for USDC (KyberSwap)
         await send_tg_message(context, f"🤑 Attempting to sell `{aero_balance:.6f}` AERO for USDC via KyberSwap...", menu_type=None)
-        swap_success, usdc_received = await execute_kyberswap_swap(context, aero_token_contract, USDC_TOKEN_ADDRESS, aero_balance)
+        swap_aero_op = functools.partial(execute_kyberswap_swap, context, aero_token_contract, USDC_TOKEN_ADDRESS, aero_balance)
+        swap_success, usdc_received_from_claim_sale = await attempt_operation_with_retries(
+            swap_aero_op, "Sell Claimed AERO via KyberSwap", context
+        )
 
         if swap_success:
-            bot_state["accumulated_profit_usdc"] += usdc_received
-            await send_tg_message(context, f"✅ Sold `{aero_balance:.6f}` AERO for `{usdc_received:.2f}` USDC. Total profit available: `${bot_state['accumulated_profit_usdc']:.2f}` USDC.")
+            usdc_amount = usdc_received_from_claim_sale if usdc_received_from_claim_sale else Decimal("0")
+            if bot_state["current_strategy"] == "take_profit":
+                bot_state["accumulated_profit_usdc"] += usdc_amount
+                await send_tg_message(context, f"✅ Sold claimed AERO for `{usdc_amount:.2f}` USDC. Profit added. Total profit: `${bot_state['accumulated_profit_usdc']:.2f}` USDC.")
+            else:
+                await send_tg_message(context, f"✅ Sold claimed AERO for `{usdc_amount:.2f}` USDC. This amount is now in the bot's wallet and will be compounded during the next rebalance.")
         else:
-            await send_tg_message(context, f"❌ Failed to sell AERO for USDC. AERO remains in bot wallet.", menu_type=None)
-            
+            await send_tg_message(context, f"❌ Failed to sell claimed AERO for USDC. AERO remains in bot wallet.", menu_type=None)
+
     except Exception as e:
         logger.error(f"Error during process_claim_sell_aero: {e}", exc_info=True)
         await send_tg_message(context, f"⚠️ Error during AERO claim/sell: {str(e)[:200]}", menu_type=None)
@@ -1604,13 +1859,11 @@ async def handle_claim_sell_aero_action(context: CallbackContext):
         await send_tg_message(context, f"Operations were paused. Resuming to {action_description}...", menu_type=None)
         bot_state["operations_halted"] = False
         await save_state_async()
-        # Add a small delay to allow the message to send and avoid immediate re-lock if process is quick
         await asyncio.sleep(0.5) 
         
-        # Re-check the processing lock in case of rapid clicks, though the main one should catch it.
         if bot_state.get("is_processing_action"):
              pass
-
+            
     await process_claim_sell_aero(context, triggered_by="manual")
 
 async def handle_force_rebalance_action(context: CallbackContext):
@@ -1633,6 +1886,7 @@ async def handle_emergency_exit_action(context: CallbackContext):
         unstake_tx_params = { 'from': BOT_WALLET_ADDRESS, 'nonce': get_nonce() }
         unstake_tx = aerodrome_gauge_contract.functions.withdraw(bot_state["aerodrome_lp_nft_id"]).build_transaction(unstake_tx_params)
         unstake_receipt = await asyncio.to_thread(_send_and_wait_for_transaction, unstake_tx, "Emergency Unstake")
+        await asyncio.sleep(13)
         if not unstake_receipt or unstake_receipt.status != 1:
             await send_tg_message(context, "⚠️ Failed to unstake LP NFT. Manual intervention may be required.", menu_type=None)
         else:
@@ -1655,9 +1909,8 @@ async def handle_emergency_exit_action(context: CallbackContext):
             decrease_tx_params = {'from': BOT_WALLET_ADDRESS, 'nonce': get_nonce()}
             decrease_tx = aerodrome_nft_manager_contract.functions.decreaseLiquidity(decrease_params).build_transaction(decrease_tx_params)
             decrease_receipt = await asyncio.to_thread(_send_and_wait_for_transaction, decrease_tx, "Emergency Decrease Liquidity")
-
+            await asyncio.sleep(13)
             if decrease_receipt and decrease_receipt.status == 1:
-                # Collect Tokens
                 collect_params = {
                     'tokenId': bot_state["aerodrome_lp_nft_id"],
                     'recipient': BOT_WALLET_ADDRESS,
@@ -1667,6 +1920,7 @@ async def handle_emergency_exit_action(context: CallbackContext):
                 collect_tx_params = {'from': BOT_WALLET_ADDRESS, 'nonce': get_nonce()}
                 collect_tx = aerodrome_nft_manager_contract.functions.collect(collect_params).build_transaction(collect_tx_params)
                 collect_receipt = await asyncio.to_thread(_send_and_wait_for_transaction, collect_tx, "Emergency Collect Tokens")
+                await asyncio.sleep(13)
                 if collect_receipt and collect_receipt.status == 1:
                     await send_tg_message(context, "✅ Liquidity withdrawn and tokens collected.", menu_type=None)
                 else:
@@ -1680,11 +1934,12 @@ async def handle_emergency_exit_action(context: CallbackContext):
     if bot_state["aerodrome_lp_nft_id"]:
         try:
             pending_aero_rewards = await get_pending_aero_rewards(context, bot_state["aerodrome_lp_nft_id"])
-            if pending_aero_rewards > Decimal("0.000001"): # Small threshold
+            if pending_aero_rewards > Decimal("0.1"):
                 await send_tg_message(context, f"Attempting to claim {pending_aero_rewards:.4f} AERO...", menu_type=None)
                 claim_tx_params = {'from': BOT_WALLET_ADDRESS, 'nonce': get_nonce()}
                 claim_tx = aerodrome_gauge_contract.functions.getReward(bot_state["aerodrome_lp_nft_id"]).build_transaction(claim_tx_params)
                 claim_receipt = await asyncio.to_thread(_send_and_wait_for_transaction, claim_tx, "Emergency Claim AERO")
+                await asyncio.sleep(13)
                 if claim_receipt and claim_receipt.status == 1:
                      await send_tg_message(context, "✅ AERO claimed.", menu_type=None)
                 else:
@@ -1695,7 +1950,7 @@ async def handle_emergency_exit_action(context: CallbackContext):
 
     # 4. Sell all WBLT for USDC
     wblt_balance = await get_token_balance(wblt_token_contract, BOT_WALLET_ADDRESS)
-    if wblt_balance > Decimal("0.01"): # Small threshold
+    if wblt_balance > Decimal("0.1"):
         await send_tg_message(context, f"Selling {wblt_balance:.4f} WBLT for USDC...", menu_type=None)
         success, _ = await execute_kyberswap_swap(context, wblt_token_contract, USDC_TOKEN_ADDRESS, wblt_balance)
         if success: await send_tg_message(context, "✅ WBLT sold for USDC.", menu_type=None)
@@ -1703,7 +1958,7 @@ async def handle_emergency_exit_action(context: CallbackContext):
 
     # 5. Sell all AERO for USDC
     aero_balance = await get_token_balance(aero_token_contract, BOT_WALLET_ADDRESS)
-    if aero_balance > Decimal("0.01"): # Small threshold
+    if aero_balance > Decimal("0.1"):
         await send_tg_message(context, f"Selling {aero_balance:.4f} AERO for USDC...", menu_type=None)
         success, _ = await execute_kyberswap_swap(context, aero_token_contract, USDC_TOKEN_ADDRESS, aero_balance)
         if success: await send_tg_message(context, "✅ AERO sold for USDC.", menu_type=None)
@@ -1714,12 +1969,11 @@ async def handle_emergency_exit_action(context: CallbackContext):
     bot_state["aerodrome_lp_nft_id"] = None
     bot_state["current_lp_principal_wblt_amount"] = Decimal("0")
     bot_state["current_lp_principal_usdc_amount"] = Decimal("0")
-    bot_state["initial_setup_pending"] = True # Requires setup again to restart
+    bot_state["initial_setup_pending"] = True
 
     final_usdc_balance = await get_token_balance(usdc_token_contract, BOT_WALLET_ADDRESS)
     await save_state_async()
     await send_tg_message(context, f"🚨 **EMERGENCY EXIT COMPLETE!** Operations halted. Bot wallet has approx. {final_usdc_balance:.2f} USDC. Please verify all transactions.", menu_type="main")
-
 
 async def handle_start_bot_operations_action(context: CallbackContext):
     if not bot_state.get("operations_halted", True):
@@ -1747,6 +2001,7 @@ async def handle_startup_stake_nft_action(context: CallbackContext):
     await send_tg_message(context, f"Attempting to stake discovered NFT ID `{nft_id}`...", menu_type=None)
     
     approved_nft_for_gauge = await approve_nft_for_spending(context, aerodrome_nft_manager_contract, AERODROME_CL_GAUGE_ADDRESS, nft_id)
+    await asyncio.sleep(13)
     if not approved_nft_for_gauge:
         await send_tg_message(context, f"❌ Failed to approve NFT {nft_id} for staking. Staking aborted. Bot remains HALTED.", menu_type="main")
         bot_state["operations_halted"] = True
@@ -1757,7 +2012,7 @@ async def handle_startup_stake_nft_action(context: CallbackContext):
     stake_tx_params = {'from': BOT_WALLET_ADDRESS, 'nonce': await asyncio.to_thread(get_nonce), 'chainId': await asyncio.to_thread(lambda: w3.eth.chain_id)}
     stake_tx = aerodrome_gauge_contract.functions.deposit(nft_id).build_transaction(stake_tx_params)
     stake_receipt = await asyncio.to_thread(_send_and_wait_for_transaction, stake_tx, f"Stake LP NFT {nft_id}")
-
+    await asyncio.sleep(13)
     if stake_receipt and stake_receipt.status == 1:
         await send_tg_message(context, f"✅ LP NFT {nft_id} successfully STAKED! Resuming normal operations.", menu_type="main")
         bot_state["operations_halted"] = False
@@ -1802,7 +2057,7 @@ async def handle_startup_withdraw_unstaked_nft_action(context: CallbackContext):
         }
         decrease_tx = aerodrome_nft_manager_contract.functions.decreaseLiquidity(decrease_params).build_transaction(decrease_tx_params)
         decrease_receipt = await asyncio.to_thread(_send_and_wait_for_transaction, decrease_tx, f"Decrease Liquidity NFT {nft_id} (Startup)")
-
+        await asyncio.sleep(13)
         if decrease_receipt and decrease_receipt.status == 1:
             await send_tg_message(context, f"✅ Liquidity decrease successful for NFT {nft_id}. Collecting tokens...", menu_type=None)
 
@@ -1820,7 +2075,7 @@ async def handle_startup_withdraw_unstaked_nft_action(context: CallbackContext):
             }
             collect_tx = aerodrome_nft_manager_contract.functions.collect(collect_params).build_transaction(collect_tx_params)
             collect_receipt_obj = await asyncio.to_thread(_send_and_wait_for_transaction, collect_tx, f"Collect Tokens NFT {nft_id} (Startup)")
-
+            await asyncio.sleep(13)
             if collect_receipt_obj and collect_receipt_obj.status == 1:
                 await send_tg_message(context, "✅ Tokens collected successfully.", menu_type=None)
             else:
@@ -1832,7 +2087,6 @@ async def handle_startup_withdraw_unstaked_nft_action(context: CallbackContext):
             return
 
         # Burn the now empty NFT
-        # Re-check liquidity before burning, just in case.
         final_pos_details_for_burn = await get_lp_position_details(context, nft_id)
         if final_pos_details_for_burn and final_pos_details_for_burn['liquidity'] == 0:
             await send_tg_message(context, f"Burning empty LP NFT {nft_id}...", menu_type=None)
@@ -1843,6 +2097,7 @@ async def handle_startup_withdraw_unstaked_nft_action(context: CallbackContext):
             }
             burn_tx = aerodrome_nft_manager_contract.functions.burn(nft_id).build_transaction(burn_tx_params)
             burn_receipt = await asyncio.to_thread(_send_and_wait_for_transaction, burn_tx, f"Burn LP NFT {nft_id} (Startup)")
+            await asyncio.sleep(13)
             if burn_receipt and burn_receipt.status == 1:
                 await send_tg_message(context, f"✅ NFT {nft_id} burned.", menu_type=None)
             else:
@@ -1860,6 +2115,7 @@ async def handle_startup_withdraw_unstaked_nft_action(context: CallbackContext):
         }
         burn_tx = aerodrome_nft_manager_contract.functions.burn(nft_id).build_transaction(burn_tx_params)
         burn_receipt = await asyncio.to_thread(_send_and_wait_for_transaction, burn_tx, f"Burn 0-Liquidity LP NFT {nft_id} (Startup)")
+        await asyncio.sleep(13)
         if burn_receipt and burn_receipt.status == 1:
             await send_tg_message(context, f"✅ NFT {nft_id} (0 liquidity) burned.", menu_type=None)
         else:
@@ -1869,7 +2125,7 @@ async def handle_startup_withdraw_unstaked_nft_action(context: CallbackContext):
 
     # --- 2. Sell all WBLT for USDC ---
     available_wblt = await get_token_balance(wblt_token_contract, BOT_WALLET_ADDRESS)
-    if available_wblt > Decimal("0.01"):
+    if available_wblt > Decimal("0.1"):
         await send_tg_message(context, f"Selling {available_wblt:.{wblt_decimals_val}f} WBLT for USDC...", menu_type=None)
         swap_success, usdc_received = await execute_kyberswap_swap(context, wblt_token_contract, USDC_TOKEN_ADDRESS, available_wblt)
         if swap_success:
@@ -1894,7 +2150,6 @@ async def handle_startup_withdraw_unstaked_nft_action(context: CallbackContext):
         menu_type="main"
     )
     await save_state_async()
-    # Optionally, call handle_status_action(context) if you want a full status update here
 
 async def handle_startup_continue_monitoring_action(context: CallbackContext):
     nft_id = bot_state.get("aerodrome_lp_nft_id")
@@ -1915,21 +2170,103 @@ async def handle_startup_unstake_and_manage_action(context: CallbackContext):
     if not nft_id:
         await send_tg_message(context, "⚠️ No staked NFT ID found in state. Please restart bot.", menu_type="main")
         bot_state["operations_halted"] = True
+        await save_state_async()
         return
 
-    await send_tg_message(context, f"Attempting to unstake NFT ID `{nft_id}` to allow manual management (rebalance/withdraw)...", menu_type=None)
+    await send_tg_message(context, f"Attempting to unstake, withdraw liquidity, and burn NFT ID `{nft_id}`...", menu_type=None)
 
-    # Unstake logic (from emergency_exit or rebalance)
-    unstake_tx_params = {'from': BOT_WALLET_ADDRESS, 'nonce': await asyncio.to_thread(get_nonce), 'chainId': await asyncio.to_thread(lambda: w3.eth.chain_id)}
+    # --- 1. Unstake ---
+    await send_tg_message(context, f"Unstaking NFT {nft_id} from gauge...", menu_type=None)
+    unstake_tx_params = {'from': BOT_WALLET_ADDRESS}
     unstake_tx = aerodrome_gauge_contract.functions.withdraw(nft_id).build_transaction(unstake_tx_params)
-    unstake_receipt = await asyncio.to_thread(_send_and_wait_for_transaction, unstake_tx, f"Unstake LP NFT {nft_id} (Startup Choice)")
+    unstake_receipt = await asyncio.to_thread(_send_and_wait_for_transaction, unstake_tx, f"Unstake LP NFT {nft_id} (Startup Manage)")
+    await asyncio.sleep(13)
 
-    if unstake_receipt and unstake_receipt.status == 1:
-        await send_tg_message(context, f"✅ LP NFT {nft_id} UNSTAKED. It's now in the bot's wallet. You can now use 'Force Rebalance' or 'Emergency Exit'. Bot remains HALTED.", menu_type="main")
+    if not (unstake_receipt and unstake_receipt.status == 1):
+        await send_tg_message(context, f"⚠️ Failed to unstake LP NFT {nft_id}. Bot remains HALTED. Staked state may be unchanged. Manual check advised.", menu_type="main")
+        bot_state["operations_halted"] = True
+        await save_state_async()
+        await handle_status_action(context)
+        return
+    
+    await send_tg_message(context, f"✅ LP NFT {nft_id} UNSTAKED. Now withdrawing liquidity...", menu_type=None)
+
+    # --- 2. Withdraw Liquidity & Burn ---
+    position_details = await get_lp_position_details(context, nft_id)
+
+    if position_details and position_details['liquidity'] > 0:
+        await send_tg_message(context, f"Withdrawing liquidity ({position_details['liquidity']}) from LP NFT {nft_id}...", menu_type=None)
+        decrease_params = {
+            'tokenId': nft_id, 'liquidity': position_details['liquidity'],
+            'amount0Min': 0, 'amount1Min': 0, 'deadline': int(time.time()) + 600
+        }
+        decrease_tx_params = {'from': BOT_WALLET_ADDRESS}
+        decrease_tx = aerodrome_nft_manager_contract.functions.decreaseLiquidity(decrease_params).build_transaction(decrease_tx_params)
+        decrease_receipt = await asyncio.to_thread(_send_and_wait_for_transaction, decrease_tx, f"Decrease Liquidity NFT {nft_id} (Startup Manage)")
+        await asyncio.sleep(13)
+
+        if decrease_receipt and decrease_receipt.status == 1:
+            collect_params = {
+                'tokenId': nft_id, 'recipient': BOT_WALLET_ADDRESS,
+                'amount0Max': 2**128 - 1, 'amount1Max': 2**128 - 1
+            }
+            collect_tx_params = {'from': BOT_WALLET_ADDRESS}
+            collect_tx = aerodrome_nft_manager_contract.functions.collect(collect_params).build_transaction(collect_tx_params)
+            collect_receipt_obj = await asyncio.to_thread(_send_and_wait_for_transaction, collect_tx, f"Collect Tokens NFT {nft_id} (Startup Manage)")
+            await asyncio.sleep(13)
+            if collect_receipt_obj and collect_receipt_obj.status == 1:
+                await send_tg_message(context, "✅ Tokens collected.", menu_type=None)
+            else:
+                await send_tg_message(context, "⚠️ Failed to collect tokens. Funds might be in wallet or require manual collection.", menu_type=None)
+        else:
+            await send_tg_message(context, f"⚠️ Failed to decrease liquidity for NFT {nft_id}. Manual check advised.", menu_type="main")
+
+        # Burn the NFT
+        final_pos_details_for_burn = await get_lp_position_details(context, nft_id) # Re-check
+        if final_pos_details_for_burn and final_pos_details_for_burn['liquidity'] == 0:
+            await send_tg_message(context, f"Burning empty LP NFT {nft_id}...", menu_type=None)
+            burn_tx_params = {'from': BOT_WALLET_ADDRESS}
+            burn_tx = aerodrome_nft_manager_contract.functions.burn(nft_id).build_transaction(burn_tx_params)
+            burn_receipt = await asyncio.to_thread(_send_and_wait_for_transaction, burn_tx, f"Burn LP NFT {nft_id} (Startup Manage)")
+            await asyncio.sleep(13)
+            if burn_receipt and burn_receipt.status == 1:
+                await send_tg_message(context, f"✅ NFT {nft_id} burned.", menu_type=None)
+            else:
+                await send_tg_message(context, f"⚠️ Failed to burn NFT {nft_id}.", menu_type=None)
+        elif final_pos_details_for_burn:
+             logger.warning(f"NFT {nft_id} still shows liquidity {final_pos_details_for_burn['liquidity']} after collect attempt. Skipping burn.")
+             await send_tg_message(context, f"⚠️ NFT {nft_id} still has liquidity. Burn skipped. Manual check needed.", menu_type=None)
+        else:
+            logger.warning(f"Could not get final position details for NFT {nft_id} before burn. It might already be gone.")
+
+
+    elif position_details and position_details['liquidity'] == 0:
+        await send_tg_message(context, f"NFT ID `{nft_id}` already has 0 liquidity. Attempting to burn...", menu_type=None)
+        burn_tx_params = {'from': BOT_WALLET_ADDRESS}
+        burn_tx = aerodrome_nft_manager_contract.functions.burn(nft_id).build_transaction(burn_tx_params)
+        burn_receipt = await asyncio.to_thread(_send_and_wait_for_transaction, burn_tx, f"Burn 0-Liquidity LP NFT {nft_id} (Startup Manage)")
+        await asyncio.sleep(13)
+        if burn_receipt and burn_receipt.status == 1:
+            await send_tg_message(context, f"✅ NFT {nft_id} (0 liquidity) burned successfully.", menu_type=None)
+        else:
+            await send_tg_message(context, f"⚠️ Failed to burn 0-liquidity NFT {nft_id}. It might already be gone or an error occurred.", menu_type=None)
+            logger.warning(f"Failed to burn 0-liquidity NFT {nft_id} during startup manage action.")
     else:
-        await send_tg_message(context, f"⚠️ Failed to unstake LP NFT {nft_id}. Bot remains HALTED. Staked state unchanged.", menu_type="main")
+        await send_tg_message(context, f"Could not find position details for NFT {nft_id}. It might have been burned already or does not belong to the WBLT/USDC pair.", menu_type=None)
 
+    # --- Finalize State ---
+    bot_state["aerodrome_lp_nft_id"] = None
+    bot_state["current_lp_principal_wblt_amount"] = Decimal("0")
+    bot_state["current_lp_principal_usdc_amount"] = Decimal("0")
+    bot_state["initial_setup_pending"] = True
     bot_state["operations_halted"] = True
+
+    await send_tg_message(
+        context,
+        f"✅ NFT {nft_id} unstaked, liquidity withdrawn, and NFT burned (or attempted). "
+        f"Bot holds WBLT/USDC. Bot is HALTED. Use 'Force Rebalance' or 'Start Bot Operations' to create a new LP.",
+        menu_type="main"
+    )
     await save_state_async()
     await handle_status_action(context)
 
@@ -1986,7 +2323,7 @@ async def main_bot_loop(application: Application):
                             logger.error("Pool tickSpacing is 0! Cannot calculate buffer. Skipping rebalance check.")
                             bot_state["is_processing_action"] = False
                             await save_state_async()
-                            await asyncio.sleep(MAIN_LOOP_INTERVAL_SECONDS) # Or a shorter error retry interval
+                            await asyncio.sleep(MAIN_LOOP_INTERVAL_SECONDS)
                             continue
 
 
@@ -2003,7 +2340,6 @@ async def main_bot_loop(application: Application):
                         # 5. Calculate the final buffer_tick_amount as a multiple of tickSpacing
                         buffer_tick_amount_aligned = num_tick_spacings_for_buffer * pool_tick_spacing
 
-                        # Safety: Ensure buffer_tick_amount_aligned doesn't make trigger points cross
                         if (2 * buffer_tick_amount_aligned) >= actual_tick_span_lp and actual_tick_span_lp > 0 :
                             if actual_tick_span_lp > pool_tick_spacing :
                                 buffer_tick_amount_aligned = pool_tick_spacing
@@ -2037,13 +2373,13 @@ async def main_bot_loop(application: Application):
                             await asyncio.sleep(MAIN_LOOP_INTERVAL_SECONDS)
                             continue
             
-            # 2. Check for AERO Claim & Sell
+            # 2. Check for AERO Claim & Sell (rest of the loop is the same)
             if bot_state["aerodrome_lp_nft_id"]:
                 pending_aero = await get_pending_aero_rewards(context, bot_state["aerodrome_lp_nft_id"])
                 time_since_last_claim = current_time - bot_state.get("last_aero_claim_time", 0)
 
                 if pending_aero >= AERO_CLAIM_THRESHOLD_AMOUNT or \
-                   (    pending_aero > Decimal("0.000001") and time_since_last_claim >= AERO_CLAIM_TIME_THRESHOLD_SECONDS) :
+                   (    pending_aero > Decimal("1.0") and time_since_last_claim >= AERO_CLAIM_TIME_THRESHOLD_SECONDS) :
                     logger.info(f"AERO claim triggered. Pending: {pending_aero}, Time since last: {time_since_last_claim/3600:.2f} hrs")
                     await process_claim_sell_aero(context, triggered_by="auto_threshold")
                     bot_state["is_processing_action"] = False
@@ -2072,7 +2408,6 @@ async def main_bot_loop(application: Application):
                 logger.error(f"Failed to send critical error message to Telegram: {te}")
             await asyncio.sleep(MAIN_LOOP_INTERVAL_SECONDS * 2)
 
-
 async def approve_nft_for_spending(context: CallbackContext, nft_contract, spender_address, token_id_to_approve: int):
     try:
         current_approved_address = await asyncio.to_thread(
@@ -2080,14 +2415,14 @@ async def approve_nft_for_spending(context: CallbackContext, nft_contract, spend
         )
 
         if current_approved_address != spender_address:
-            await send_tg_message(context, f"👍 Approving NFT ID `{token_id_to_approve}` for spender {spender_address}...", menu_type=None)
+            await send_tg_message(context, f"👍 Approving NFT ID `{token_id_to_approve}` for spender `{spender_address}`...", menu_type=None)
             
             tx_params = {
                 'from': BOT_WALLET_ADDRESS,
                 'nonce': get_nonce(),
             }
-
             approve_tx = nft_contract.functions.approve(spender_address, token_id_to_approve).build_transaction(tx_params)
+            
             receipt = await asyncio.to_thread(_send_and_wait_for_transaction, approve_tx, f"Approve NFT {token_id_to_approve}")
             return receipt is not None and receipt.status == 1
         else:
@@ -2117,10 +2452,10 @@ def main():
     bot_state["is_processing_action"] = False 
     logger.info("Bot forced into HALTED state on script startup. Initializing...")
 
-    # Set initial NFT ID from config if provided and not already in state (this is a fallback)
+    # Set initial NFT ID from config if provided and not already in state
     if INITIAL_LP_NFT_ID_CONFIG is not None and bot_state.get("aerodrome_lp_nft_id") is None:
         logger.info(f"Using initial LP NFT ID from config: {INITIAL_LP_NFT_ID_CONFIG} (will be verified by discovery)")
-        bot_state["aerodrome_lp_nft_id"] = INITIAL_LP_NFT_ID_CONFIG # Tentatively set
+        bot_state["aerodrome_lp_nft_id"] = INITIAL_LP_NFT_ID_CONFIG
 
     # --- Application and Event Loop ---
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
@@ -2128,7 +2463,7 @@ def main():
 
     # --- LP State Discovery and User Interaction on Startup ---
     async def startup_sequence(app: Application):
-        nonlocal loop # Allow modification of the outer loop variable if needed, though not strictly here
+        nonlocal loop
         startup_context = CallbackContext(app)
         await send_tg_message(startup_context, "🤖 Bot instance starting up. Discovering LP state...", menu_type=None)
 
@@ -2154,7 +2489,7 @@ def main():
             else:
                 logger.error(f"Discovered NFT {discovered_nft_id} but with unknown status: {discovered_status}. Halting.")
                 await send_tg_message(startup_context, f"⚠️ Error: Discovered NFT {discovered_nft_id} with unknown status. Manual check needed. Bot HALTED.", menu_type="main")
-                bot_state["operations_halted"] = True # Ensure halted
+                bot_state["operations_halted"] = True
 
         else:
             logger.info("No active WBLT/USDC LP NFT discovered on-chain for the bot.")
@@ -2166,25 +2501,22 @@ def main():
                 )
             bot_state["aerodrome_lp_nft_id"] = None
             bot_state["initial_setup_pending"] = True
+            # Standard startup message for initial setup
             await send_tg_message(startup_context, "Operations are PAUSED. Use menu to start.", menu_type="main")
             if bot_state.get("initial_setup_pending", True):
                  await send_tg_message(startup_context, f"ℹ️ Initial setup needed: No LP NFT found. Send WBLT/USDC to `{BOT_WALLET_ADDRESS}` or set an existing NFT ID via Manage Principal before starting operations.", menu_type="main")
 
         save_state_sync()
-
-        # Schedule the main bot loop AFTER startup sequence is done or user has made a choice
-        # The main loop will only run if operations_halted becomes false.
         loop.create_task(main_bot_loop(app))
         logger.info("Main bot loop scheduled. Startup sequence complete or awaiting user input.")
 
-    # --- Add Handlers ---
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("menu", menu_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message_handler))
 
-    # --- Startup ---
+    # --- Run Startup Sequence ---
     try:
         loop.run_until_complete(startup_sequence(application))
         logger.info("Starting Telegram bot polling...")
