@@ -3,7 +3,9 @@
 Python script for the lazy, automating managing your Aerodrome Concentrated Liquidity position so you can stop clicking so much on Aerodrome.
 
 - Rebalances when price hits trigger thresholds of range.
+  - Also has force rebalance button. Besides built in retries, this can retry or recover from failed transactions.
 - Claims pending AERO rewards.
+  - Also has manual claim and sell button.
 - Sells claimed AERO (to USDC via KyberSwap).
 - Manages that USDC profit (keep in wallet or compound into the LP).
 - Lets you withdraw USDC profit or entire USDC balance.
