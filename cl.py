@@ -1873,7 +1873,7 @@ async def handle_status_action(context: CallbackContext):
     wblt_bal_usd_value = wblt_bal * price_wblt_in_usd_ds
     aero_bal_usd_value = aero_bal * price_aero_in_usd_ds
 
-    status_lines.append(f"💰 `{usdc_bal:.2f} USDC` (`${usdc_bal_usd_value:.2f}`)")
+    status_lines.append(f"💰 `{usdc_bal:.4f} USDC` (`${usdc_bal_usd_value:.2f}`)")
     status_lines.append(f"🌯 `{wblt_bal:.4f} WBLT` (`${wblt_bal_usd_value:.2f}`)")
     status_lines.append(f"✈️ `{aero_bal:.4f} AERO` (`${aero_bal_usd_value:.2f}`)")
     status_lines.append("---")
@@ -1943,7 +1943,7 @@ async def handle_status_action(context: CallbackContext):
             price_at_tick_upper_lp = (Decimal("1.0001")**Decimal(tick_upper_lp)) * decimal_adj_factor_for_price
                         
             status_lines.append(f"📐 Tick Range: `{tick_lower_lp}` to `{tick_upper_lp}`")
-            status_lines.append(f"💲 Price Range: `{price_at_tick_lower_lp:.4f}` - `{price_at_tick_upper_lp:.4f}` `({TARGET_RANGE_WIDTH_PERCENTAGE}%)`") 
+            status_lines.append(f"💲 Price Range: `{price_at_tick_lower_lp:.4f}` - `{price_at_tick_upper_lp:.4f}`") 
 
             if price_wblt_in_usd_ds > 0:
                  status_lines.append(f"💵 WBLT: `{onchain_wblt_price_vs_usdc:.4f} USDC` (`${price_wblt_in_usd_ds:.4f}`)")
@@ -1954,9 +1954,7 @@ async def handle_status_action(context: CallbackContext):
                 price_at_lower_trigger = (Decimal("1.0001")**Decimal(lower_trigger_tick_for_status)) * decimal_adj_factor_for_price
                 price_at_upper_trigger = (Decimal("1.0001")**Decimal(upper_trigger_tick_for_status)) * decimal_adj_factor_for_price
                 status_lines.append(
-                    f"🔔 Rebalance Triggers: `<{price_at_lower_trigger:.4f}`, `>{price_at_upper_trigger:.4f}` "
-                    f"`({REBALANCE_TRIGGER_BUFFER_PERCENTAGE}%)`"
-                )
+                    f"🔔 Rebalance Triggers: `<{price_at_lower_trigger:.4f}`, `>{price_at_upper_trigger:.4f}`")
             elif actual_tick_span_lp <= 0:
                  status_lines.append("  ❗ LP range span is zero or negative, cannot calculate buffer.")
             else:
@@ -1966,7 +1964,7 @@ async def handle_status_action(context: CallbackContext):
                 lp_liquidity, current_tick, tick_lower_lp, tick_upper_lp,
                 wblt_decimals_val, usdc_decimals_val
             )
-            status_lines.append(f"💼 Principal: `{actual_wblt_in_lp:.4f} WBLT` & `{actual_usdc_in_lp:.2f} USDC`")
+            status_lines.append(f"💼 Balance: `{actual_wblt_in_lp:.4f} WBLT` & `{actual_usdc_in_lp:.2f} USDC`")
             
             est_value_wblt_usd = actual_wblt_in_lp * price_wblt_in_usd_ds
             est_value_usdc_usd = actual_usdc_in_lp * price_usdc_in_usd
@@ -2410,7 +2408,9 @@ async def process_full_rebalance(context: CallbackContext, triggered_by="auto"):
         )
         logger.info(f"Prepared 12-ELEMENT params tuple for mint: {mint_params_as_tuple}")
 
-         # Wrap the mint operation
+        await send_tg_message(context, f"ℹ️ Minting new LP...", menu_type=None)
+        
+        # Wrap the mint operation
         mint_op_callable = functools.partial(_execute_mint_lp_operation, context, mint_params_as_tuple)
     
         mint_op_success, mint_op_result_data = await attempt_operation_with_retries(
@@ -2418,7 +2418,7 @@ async def process_full_rebalance(context: CallbackContext, triggered_by="auto"):
             "Full Mint LP Operation",
             context,
             max_retries=2,
-            delay_seconds=45 
+            delay_seconds=13 
         )
 
         mint_receipt = None
@@ -2489,7 +2489,7 @@ async def process_full_rebalance(context: CallbackContext, triggered_by="auto"):
                 f"Stake LP NFT {new_nft_id}",
                 context,
                 max_retries=2,
-                delay_seconds=30
+                delay_seconds=13
             )
 
             if not stake_op_success:
