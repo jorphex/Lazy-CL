@@ -2134,26 +2134,46 @@ async def handle_withdraw_wallet_usdc_menu_action(context: CallbackContext):
     )
     await send_tg_message(context, message, menu_type="withdraw_wallet_usdc")
 
+async def handle_withdraw_wallet_usdc_menu_action(context: CallbackContext):
+    if not USER_PROFIT_WITHDRAWAL_ADDRESS or "YOUR_PERSONAL_WALLET_ADDRESS" in USER_PROFIT_WITHDRAWAL_ADDRESS:
+        await send_tg_message(context, "⚠️ Withdrawal address is not configured.")
+        return
+        
+    bot_usdc_balance_live = await get_token_balance(usdc_token_contract, BOT_WALLET_ADDRESS)
+    usdc_decimals = await asyncio.to_thread(usdc_token_contract.functions.decimals().call)
+    balance_str = f"{bot_usdc_balance_live:.{usdc_decimals}f} USDC"
+    
+    message = (
+        f"Available liquid USDC in bot wallet: {balance_str}\n"
+        f"Withdrawals sent to: `{USER_PROFIT_WITHDRAWAL_ADDRESS}`\n\n"
+        "Choose an option for WALLET USDC:"
+    )
+    await send_tg_message(context, message, menu_type="withdraw_wallet_usdc")
+
 async def _execute_profit_withdrawal(context: CallbackContext, amount_decimal: Decimal):
     if amount_decimal <= 0:
-        await send_tg_message(context, "Withdrawal amount must be positive.")
+        await send_tg_message(context, "ℹ️ Withdrawal amount must be positive.")
         return
 
-    current_accumulated_profit = bot_state.get('accumulated_profit_usdc', Decimal(0))
-    if amount_decimal > current_accumulated_profit:
-        await send_tg_message(context, f"ℹ️ Insufficient profit. Requested: {amount_decimal:.2f}, Available: {current_accumulated_profit:.2f} USDC.")
-        return
-
-    bot_usdc_wallet_balance = await get_token_balance(usdc_token_contract, BOT_WALLET_ADDRESS)
-    if bot_usdc_wallet_balance < amount_decimal:
+    current_tracked_profit = bot_state.get('accumulated_profit_usdc', Decimal(0))
+    if amount_decimal > current_tracked_profit:
         await send_tg_message(context, 
-            f"⚠️ Bot's USDC wallet balance ({bot_usdc_wallet_balance:.2f}) is less than requested profit withdrawal ({amount_decimal:.2f}). "
-            f"This shouldn't happen if profit tracking is correct. Manual check needed."
+            f"Insufficient tracked profit. Requested: {amount_decimal:.2f}, "
+            f"Available tracked profit: {current_tracked_profit:.2f} USDC."
         )
         return
 
+    bot_usdc_wallet_balance = await get_token_balance(usdc_token_contract, BOT_WALLET_ADDRESS)
     usdc_decimals = await asyncio.to_thread(usdc_token_contract.functions.decimals().call)
-    await send_tg_message(context, f"Attempting to withdraw {amount_decimal:.2f} USDC profit to {USER_PROFIT_WITHDRAWAL_ADDRESS}...", menu_type=None)
+
+    if bot_usdc_wallet_balance < amount_decimal:
+        await send_tg_message(context, 
+            f"⚠️ Bot's USDC wallet balance ({bot_usdc_wallet_balance:.{usdc_decimals}f}) is less than requested profit withdrawal ({amount_decimal:.2f}). "
+            f"This indicates a discrepancy between tracked profit and available liquid USDC. Manual check needed. Withdrawal aborted."
+        )
+        return
+
+    await send_tg_message(context, f"ℹ️ Attempting to withdraw {amount_decimal:.2f} USDC profit to {USER_PROFIT_WITHDRAWAL_ADDRESS}...", menu_type=None)
     
     amount_wei = to_wei(amount_decimal, usdc_decimals)
     tx_params = {'from': BOT_WALLET_ADDRESS}
@@ -2162,9 +2182,16 @@ async def _execute_profit_withdrawal(context: CallbackContext, amount_decimal: D
     receipt = await asyncio.to_thread(_send_and_wait_for_transaction, transfer_tx, f"Withdraw {amount_decimal:.2f} USDC Profit")
 
     if receipt and receipt.status == 1:
-        bot_state["accumulated_profit_usdc"] = current_accumulated_profit - amount_decimal # Decrement tracked profit
+        bot_state["accumulated_profit_usdc"] = current_tracked_profit - amount_decimal
         await save_state_async()
-        await send_tg_message(context, f"✅ Successfully withdrew {amount_decimal:.2f} USDC profit! Remaining tracked profit: {bot_state['accumulated_profit_usdc']:.2f} USDC.")
+        new_tracked_profit = bot_state.get('accumulated_profit_usdc', Decimal(0))
+        new_wallet_balance = await get_token_balance(usdc_token_contract, BOT_WALLET_ADDRESS)
+
+        await send_tg_message(context, 
+            f"✅ Successfully withdrew {amount_decimal:.2f} USDC profit.\n"
+            f"Remaining tracked profit: {new_tracked_profit:.2f} USDC.\n"
+            f"Bot wallet USDC balance: {new_wallet_balance:.{usdc_decimals}f}."
+        )
     else:
         await send_tg_message(context, f"❌ Profit withdrawal of {amount_decimal:.2f} USDC FAILED.")
 
