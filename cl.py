@@ -2290,11 +2290,34 @@ async def process_full_rebalance(context: CallbackContext, triggered_by="auto"):
 
         # 4. Sell ALL AERO (from wallet, which includes any just auto-claimed from unstake)
         logger.info("Attempting to sell any AERO present in the wallet...")
-        sell_success, usdc_from_aero_sale = await _sell_all_available_aero_in_wallet(context)
-        if sell_success and usdc_from_aero_sale > 0:
-            available_usdc += usdc_from_aero_sale
-            logger.info(f"Added {usdc_from_aero_sale:.2f} USDC from AERO sale to available funds.")
-        logger.info(f"Funds after AERO sale attempt - WBLT: {available_wblt}, USDC: {available_usdc}")
+        if initial_wallet_aero > Decimal("1.0"):
+            sell_success, usdc_from_aero_sale = await _sell_all_available_aero_in_wallet(context)
+            if sell_success and usdc_from_aero_sale > 0:
+                if bot_state["current_strategy"] == "take_profit":
+                    bot_state["accumulated_profit_usdc"] = bot_state.get("accumulated_profit_usdc", Decimal(0)) + usdc_from_aero_sale
+                    logger.info(f"Added {usdc_from_aero_sale:.2f} USDC from AERO sale to accumulated profit. New total: {bot_state['accumulated_profit_usdc']:.2f}")
+                else:
+                    working_usdc += usdc_from_aero_sale
+                    logger.info(f"Added {usdc_from_aero_sale:.2f} USDC from AERO sale to working USDC for compounding.")
+
+        logger.info(f"Funds after AERO sale processing - Working WBLT: {working_wblt:.8f}, Working USDC: {working_usdc:.8f}, Tracked Profit: {bot_state.get('accumulated_profit_usdc', Decimal(0)):.2f}")
+        
+        usdc_for_lp_operations = working_usdc
+        if bot_state["current_strategy"] == "take_profit":
+            profit_to_set_aside = bot_state.get("accumulated_profit_usdc", Decimal(0)) 
+            current_physical_wallet_usdc = await get_token_balance(usdc_token_contract, BOT_WALLET_ADDRESS)
+            usdc_for_lp_operations = current_physical_wallet_usdc - profit_to_set_aside
+            
+            if usdc_for_lp_operations < Decimal(0):
+                logger.warning(f"Tracked profit {profit_to_set_aside:.2f} exceeds current physical wallet USDC {current_physical_wallet_usdc:.2f}. "
+                               f"Using 0 USDC for LP operations. This may indicate a discrepancy.")
+                usdc_for_lp_operations = Decimal(0)
+            
+            logger.info(f"Take Profit Mode: Physical Wallet USDC: {current_physical_wallet_usdc:.2f}. "
+                        f"Tracked Profit to set aside: {profit_to_set_aside:.2f}. "
+                        f"USDC available for LP operations: {usdc_for_lp_operations:.2f}")
+        
+        logger.info(f"Final funds for LP operations - WBLT: {working_wblt:.8f}, USDC: {usdc_for_lp_operations:.8f}")
         
         # 5. Determine New Optimal LP Range
         price_wblt_human_for_range, pool_current_tick = await get_aerodrome_pool_price_and_tick()
@@ -2328,12 +2351,11 @@ async def process_full_rebalance(context: CallbackContext, triggered_by="auto"):
         logger.info("Performing targeted swap (if needed) to optimize token ratio for the chosen LP range using all available capital...")
         final_wblt_for_mint, final_usdc_for_mint = await _perform_targeted_swap_for_optimal_ratio(
             context,
-        current_pool_sqrt_price_x96_raw,
-        new_tick_lower, new_tick_upper,
-        available_wblt, available_usdc, 
-        price_wblt_human_for_range,
-        wblt_decimals_val,
-        usdc_decimals_val
+            pool_current_tick, new_tick_lower, new_tick_upper,
+            working_wblt, usdc_for_lp_operations,
+            price_wblt_human_for_range,
+            wblt_decimals_val,
+            usdc_decimals_val
         )
         logger.info(f"Final balances intended for mint (after potential targeted swap): WBLT={final_wblt_for_mint:.8f}, USDC={final_usdc_for_mint:.8f}")
         await asyncio.sleep(13)
