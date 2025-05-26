@@ -22,3 +22,4 @@ Python script for the lazy, automating managing your Aerodrome Concentrated Liqu
 ### To Do
 - Automatically fund gas: sell 10-20 USDC or AERO for ETH when ETH balance drops below threshold.
 - Display AERO APR in bot status messages (I have no idea where to get this data).
+- Change user EOA for withdrawals
