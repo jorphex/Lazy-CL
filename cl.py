@@ -2864,53 +2864,67 @@ async def main_bot_loop(application: Application):
             await asyncio.sleep(MAIN_LOOP_INTERVAL_SECONDS * 2)
 
 
-async def approve_nft_for_spending(context: CallbackContext, nft_contract, spender_address, token_id_to_approve: int):
+async def approve_nft_for_spending(
+    context: CallbackContext, 
+    nft_contract_obj,
+    spender_address_val: str,
+    token_id_to_approve: int
+) -> bool:
     try:
-        spender_name = CONTRACT_NAME_MAP.get(Web3.to_checksum_address(spender_address), spender_address)
-
-        current_approved_address_raw = await asyncio.to_thread(
-            nft_contract.functions.getApproved(token_id_to_approve).call
+        # 1. Check who is the current owner of the NFT
+        current_owner = await asyncio.to_thread(
+            nft_contract_obj.functions.ownerOf(token_id_to_approve).call
         )
-        current_approved_address = Web3.to_checksum_address(current_approved_address_raw) if current_approved_address_raw != '0x0000000000000000000000000000000000000000' else None
+        if Web3.to_checksum_address(current_owner) != BOT_WALLET_ADDRESS:
+            logger.error(f"Bot does not own NFT {token_id_to_approve}. Current owner: {current_owner}. Cannot approve.")
+            await send_tg_message(context, f"❌ Bot does not own LP {token_id_to_approve} to approve.", menu_type=None)
+            return False
 
-        is_operator_approved = await asyncio.to_thread(
-            nft_contract.functions.isApprovedForAll(BOT_WALLET_ADDRESS, spender_address).call
+        # 2. Check if already approved to the correct spender
+        current_approved_address = await asyncio.to_thread(
+            nft_contract_obj.functions.getApproved(token_id_to_approve).call
         )
-
-        if is_operator_approved:
-            logger.info(f"Operator {spender_name} ({spender_address}) is already approved for all NFTs of {BOT_WALLET_ADDRESS}.")
+        if Web3.to_checksum_address(current_approved_address) == Web3.to_checksum_address(spender_address_val):
+            logger.info(f"NFT ID {token_id_to_approve} already approved for {spender_address_val}.")
             return True
+
+        # 3. If not approved, then approve
+        await send_tg_message(context, f"ℹ️ Approving LP `{token_id_to_approve}` for spender {spender_address_val[:10]}...", menu_type=None)
         
-        if current_approved_address != Web3.to_checksum_address(spender_address):
-            await send_tg_message(
-                context, 
-                f"ℹ️ Approving LP `{token_id_to_approve}` for spender: **{spender_name}**...", 
-                menu_type=None
-            )
-            
-            approve_tx_params = {'from': BOT_WALLET_ADDRESS}
-            approve_tx = nft_contract.functions.approve(spender_address, token_id_to_approve).build_transaction(approve_tx_params)
-            
-            receipt = await asyncio.to_thread(
-                _send_and_wait_for_transaction, 
-                approve_tx, 
-                f"Approve LP {token_id_to_approve} for {spender_name}"
-            )
+        approve_tx_params = {'from': BOT_WALLET_ADDRESS}
+        approve_tx_obj = nft_contract_obj.functions.approve(spender_address_val, token_id_to_approve)
+        
+        try:
+            approve_tx_dict = approve_tx_obj.build_transaction(approve_tx_params)
+        except Exception as e_build:
+            logger.error(f"Error building approval tx for LP {token_id_to_approve}: {e_build}", exc_info=True)
+            await send_tg_message(context, f"❌ Error building approval tx for LP {token_id_to_approve}.", menu_type=None)
+            return False
+        
+        # 4. Send the transaction
+        receipt = await asyncio.to_thread(
+            _send_and_wait_for_transaction, 
+            approve_tx_dict, 
+            f"Approve NFT {token_id_to_approve} for {spender_address_val[:10]}"
+        )
 
-            if receipt is not None and receipt.status == 1:
-                await send_tg_message(context, f"✅ Approved LP `{token_id_to_approve}` for **{spender_name}**!", menu_type=None)
-                await asyncio.sleep(13)
-                return True
-            else:
-                await send_tg_message(context, f"❌ Failed to approve LP `{token_id_to_approve}` for **{spender_name}**.", menu_type=None)
-                return False
-        else:
-            logger.info(f"ℹ️ LP {token_id_to_approve} already approved for {spender_name} ({spender_address}).")
+        if receipt and receipt.status == 1:
+            logger.info(f"Successfully approved LP {token_id_to_approve} for {spender_address_val}.")
+            await send_tg_message(context, f"✅ LP {token_id_to_approve} approved!", menu_type=None)
+            await asyncio.sleep(13)
             return True
+        else:
+            logger.error(f"Failed to approve LP {token_id_to_approve} for {spender_address_val}. Receipt: {receipt}")
+            await send_tg_message(context, f"❌ Failed to approve LP {token_id_to_approve}.", menu_type=None)
+            return False
+
+    except ContractLogicError as cle:
+        logger.error(f"ContractLogicError in approve_nft_for_spending for LP {token_id_to_approve} to {spender_address_val}: {cle.message} Data: {cle.data}", exc_info=True)
+        await send_tg_message(context, f"❌ Contract error approving LP {token_id_to_approve}: {str(cle.message)[:100]}", menu_type=None)
+        return False
     except Exception as e:
-        spender_name_for_error = CONTRACT_NAME_MAP.get(Web3.to_checksum_address(spender_address), spender_address)
-        logger.error(f"Error in approve_nft_for_spending for LP {token_id_to_approve} to {spender_name_for_error}: {e}", exc_info=True)
-        await send_tg_message(context, f"Error approving LP {token_id_to_approve} for {spender_name_for_error}: {str(e)[:100]}", menu_type=None)
+        logger.error(f"Error in approve_nft_for_spending for NFT {token_id_to_approve}: {e}", exc_info=True)
+        await send_tg_message(context, f"❌ Error approving NFT {token_id_to_approve}: {str(e)[:100]}", menu_type=None)
         return False
 
 # --- Application ---
