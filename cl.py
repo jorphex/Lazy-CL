@@ -1961,8 +1961,6 @@ async def handle_status_action(context: CallbackContext):
                  status_lines.append("  ❗ LP range span is zero or negative, cannot calculate buffer.")
             else:
                  status_lines.append("  ❗ Could not determine buffer trigger prices.")
-            
-            status_lines.append(f"💧 Liquidity: `{lp_liquidity}`")
 
             actual_wblt_in_lp, actual_usdc_in_lp = await get_amounts_for_liquidity(
                 lp_liquidity, current_tick, tick_lower_lp, tick_upper_lp,
@@ -1991,8 +1989,6 @@ async def handle_status_action(context: CallbackContext):
                 fees_usdc_usd_value = uncollected_usdc_human * price_usdc_in_usd
                 total_fees_usd_value = fees_wblt_usd_value + fees_usdc_usd_value
                 status_lines.append(f"🤑 Fees: `{uncollected_wblt_human:.4f} WBLT` & `{uncollected_usdc_human:.2f} USDC` (`~${total_fees_usd_value:.2f}`)")
-            else:
-                status_lines.append("🤑 Fees: `None`")
 
             pending_aero = await get_pending_aero_rewards(context, current_nft_id_in_state)
             pending_aero_usd_value = pending_aero * price_aero_in_usd_ds
@@ -2007,8 +2003,6 @@ async def handle_status_action(context: CallbackContext):
     profit_value_str = f"{bot_state.get('accumulated_profit_usdc', Decimal(0)):.2f}"
     status_lines.append(f"💸 Tracked Profit: `${profit_value_str} USDC`")
     status_lines.append(f"🛑 Halted: `{'YES' if bot_state['operations_halted'] else 'NO'}`")
-    status_lines.append(f"🔒 Lock: `{'ENGAGED' if bot_state.get('is_processing_action', False) else 'FREE'}`")
-    status_lines.append(f"🛠️ Setup: `{'YES' if bot_state.get('initial_setup_pending', True) else 'NO'}`")
 
     bot_state["last_telegram_status_update_time"] = time.time()
     await save_state_async()
@@ -2524,6 +2518,7 @@ async def process_claim_sell_aero(context: CallbackContext, triggered_by="auto")
         await send_tg_message(context, f"⚠️ AERO claim failed for NFT {nft_id_to_claim}. Sale skipped.", menu_type=None)
     
     await save_state_async()
+    await handle_status_action(context)
 
 
 async def handle_claim_sell_aero_action(context: CallbackContext):
@@ -2844,7 +2839,6 @@ async def main_bot_loop(application: Application):
                     await process_claim_sell_aero(context, triggered_by="auto_threshold")
                     bot_state["is_processing_action"] = False
                     await save_state_async()
-                    await handle_status_action(context)
                     await asyncio.sleep(MAIN_LOOP_INTERVAL_SECONDS)
                     continue
             
