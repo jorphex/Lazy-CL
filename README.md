@@ -19,6 +19,9 @@ Python script for the lazy, automating managing your Aerodrome Concentrated Liqu
 - Can probably be mass produced for multiple pools using Ape's Silverback
 - Probably works on Velo and other forks and chains.
 
+![image](https://github.com/user-attachments/assets/1e5e322b-4805-427c-8d36-2e7b85eb1562)
+![image](https://github.com/user-attachments/assets/2d3dfae5-b08e-452b-a42d-aae6819ebc78)
+
 ### To Do
 - Automatically fund gas: sell 10-20 USDC or AERO for ETH when ETH balance drops below threshold.
 - Display AERO APR in bot status messages (I have no idea where to get this data).
