@@ -33,7 +33,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- CONFIGURATION ---
-# use .env here or die!
 load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_ADMIN_USER_ID_STR = os.getenv("TELEGRAM_ADMIN_USER_ID")
@@ -85,16 +84,16 @@ DEXSCREENER_PAIR_USDC_STABLE = "0x98c7a2338336d2d354663246f64676009c7bda97"
 
 # Bot Settings
 SLIPPAGE_BPS = 100  # 1%
-TARGET_RANGE_WIDTH_PERCENTAGE = Decimal("2.0")  # 2% total width for the LP position
-REBALANCE_TRIGGER_BUFFER_PERCENTAGE = Decimal("5.0") # 5% buffer from each edge of the active range
+TARGET_RANGE_WIDTH_PERCENTAGE = Decimal("2.0") # 2% total width for the LP position
+REBALANCE_TRIGGER_BUFFER_PERCENTAGE = Decimal("2.0") # 2% buffer from each edge of the active range
 AERO_CLAIM_THRESHOLD_AMOUNT = Decimal("50") # Claim AERO if pending > 50 AERO
 AERO_CLAIM_TIME_THRESHOLD_SECONDS = 12 * 60 * 60 # Claim AERO every 12 hours
-MAIN_LOOP_INTERVAL_SECONDS = 15 * 60 # Check conditions every 15 minutes
+MAIN_LOOP_INTERVAL_SECONDS = 10 * 60 # Check conditions every 10 minutes
 PERIODIC_STATUS_UPDATE_INTERVAL_SECONDS = 6 * 60 * 60 # every 6 hours
 TRANSACTION_TIMEOUT_SECONDS = 360 # 6 minutes for transaction receipt
 INITIAL_LP_NFT_ID_CONFIG = None
-MIN_SWAP_THRESHOLD_WBLT = Decimal("0.1") # Don't swap less than 1.0 WBLT
-MIN_SWAP_THRESHOLD_USDC = Decimal("1.0")  # Don't swap less than 1.0 USDC
+MIN_SWAP_THRESHOLD_WBLT = Decimal("0.1") # Example: Don't swap less than 0.1 WBLT
+MIN_SWAP_THRESHOLD_USDC = Decimal("1.0")  # Example: Don't swap less than 1.0 USDC
 
 OperationCoro = Callable[[], Awaitable[Tuple[bool, Optional[Decimal]]]]
 
@@ -521,7 +520,7 @@ async def _execute_stake_lp_nft(context: CallbackContext, nft_id_to_stake: int) 
     """
     if not nft_id_to_stake:
         logger.error("_execute_stake_lp_nft: No NFT ID provided.")
-        return False
+        return False, None
 
     await send_tg_message(context, f"ℹ️ Preparing to stake LP `{nft_id_to_stake}`...", menu_type=None)
 
@@ -535,7 +534,7 @@ async def _execute_stake_lp_nft(context: CallbackContext, nft_id_to_stake: int) 
 
     if not approved_nft_for_gauge:
         logger.error(f"Failed to approve LP {nft_id_to_stake} for staking. Staking aborted.")
-        return False
+        return False, None
     
     await send_tg_message(context, f"ℹ️ Staking LP...", menu_type=None)
 
@@ -548,7 +547,7 @@ async def _execute_stake_lp_nft(context: CallbackContext, nft_id_to_stake: int) 
     except Exception as e_build:
         logger.error(f"Error building stake transaction for LP {nft_id_to_stake}: {e_build}", exc_info=True)
         await send_tg_message(context, f"❌ Error building stake transaction for LP {nft_id_to_stake}.", menu_type=None)
-        return False
+        return False, None
 
     stake_receipt = await asyncio.to_thread(
         _send_and_wait_for_transaction, 
@@ -559,10 +558,10 @@ async def _execute_stake_lp_nft(context: CallbackContext, nft_id_to_stake: int) 
     if stake_receipt and stake_receipt.status == 1:
         await send_tg_message(context, f"✅ LP {nft_id_to_stake} successfully STAKED!", menu_type=None)
         bot_state["last_aero_claim_time"] = time.time()
-        return True
+        return True, None
     else:
         await send_tg_message(context, f"⚠️ Failed to stake LP {nft_id_to_stake}. Receipt: {stake_receipt}", menu_type=None)
-        return False
+        return False, None
 
 async def _sell_all_available_aero_in_wallet(context: CallbackContext) -> tuple[bool, Decimal]:
     """Checks wallet AERO balance and sells if above threshold. Returns (success, usdc_received)."""
@@ -1946,20 +1945,19 @@ async def handle_status_action(context: CallbackContext):
             status_lines.append(f"💲 Price Range: `{price_at_tick_lower_lp:.4f}` - `{price_at_tick_upper_lp:.4f}`") 
 
             if price_wblt_in_usd_ds > 0:
-                 status_lines.append(f"💵 WBLT: `{onchain_wblt_price_vs_usdc:.4f} USDC` (`${price_wblt_in_usd_ds:.4f}`)")
+                 status_lines.append(f"💵 WBLT: `{onchain_wblt_price_vs_usdc:.4f} USDC` (`${price_wblt_in_usd_ds:.2f}`)")
             else:
                 status_lines.append(f"💵 WBLT: `{onchain_wblt_price_vs_usdc:.4f} USDC`")
 
             if can_show_buffer_info:
                 price_at_lower_trigger = (Decimal("1.0001")**Decimal(lower_trigger_tick_for_status)) * decimal_adj_factor_for_price
                 price_at_upper_trigger = (Decimal("1.0001")**Decimal(upper_trigger_tick_for_status)) * decimal_adj_factor_for_price
-                status_lines.append(
-                    f"🔔 Rebalance Triggers: `<{price_at_lower_trigger:.4f}`, `>{price_at_upper_trigger:.4f}`")
+                status_lines.append(f"🔔 Rebalance Triggers: `<{price_at_lower_trigger:.4f}`, `>{price_at_upper_trigger:.4f}`")
             elif actual_tick_span_lp <= 0:
                  status_lines.append("  ❗ LP range span is zero or negative, cannot calculate buffer.")
             else:
                  status_lines.append("  ❗ Could not determine buffer trigger prices.")
-
+            
             actual_wblt_in_lp, actual_usdc_in_lp = await get_amounts_for_liquidity(
                 lp_liquidity, current_tick, tick_lower_lp, tick_upper_lp,
                 wblt_decimals_val, usdc_decimals_val
@@ -2045,7 +2043,7 @@ async def _execute_fund_withdrawal(context: CallbackContext, amount_decimal: Dec
         await send_tg_message(context, f"Insufficient {token_symbol_for_log} in wallet. Requested: {amount_decimal:.{token_decimals}f}, Available: {bot_token_balance:.{token_decimals}f}.")
         return
 
-    await send_tg_message(context, f"Attempting to withdraw {amount_decimal:.{token_decimals}f} {token_symbol_for_log} to {USER_PROFIT_WITHDRAWAL_ADDRESS}...", menu_type=None)
+    await send_tg_message(context, f"ℹ️ Attempting to withdraw `{amount_decimal:.4f}` {token_symbol_for_log} to `{USER_PROFIT_WITHDRAWAL_ADDRESS}`...", menu_type=None)
     
     amount_wei = to_wei(amount_decimal, token_decimals)
 
@@ -2057,19 +2055,36 @@ async def _execute_fund_withdrawal(context: CallbackContext, amount_decimal: Dec
     if receipt and receipt.status == 1:
         new_bot_balance = await get_token_balance(token_contract, BOT_WALLET_ADDRESS)
         await send_tg_message(context, 
-            f"✅ Successfully withdrew {amount_decimal:.{token_decimals}f} {token_symbol_for_log}.\n"
-            f"New bot wallet balance: {new_bot_balance:.{token_decimals}f} {token_symbol_for_log}."
+            f"✅ Successfully withdrew `{amount_decimal:.4f}` {token_symbol_for_log}.\n"
+            f"New bot wallet balance: `{new_bot_balance:.{token_decimals}f}` {token_symbol_for_log}."
         )
     else:
         await send_tg_message(context, f"❌ {token_symbol_for_log} withdrawal of {amount_decimal:.{token_decimals}f} FAILED.")
     await save_state_async()
 
 async def handle_withdraw_wallet_usdc_all_action(context: CallbackContext):
-    bot_usdc_balance_live = await get_token_balance(usdc_token_contract, BOT_WALLET_ADDRESS)
-    if bot_usdc_balance_live > Decimal("1.0"):
-        await _execute_fund_withdrawal(context, bot_usdc_balance_live, usdc_token_contract, "Wallet USDC")
-    else:
-        await send_tg_message(context, f"ℹ️ No considerable USDC available in wallet to withdraw. `{bot_usdc_balance_live:.2f} USDC`")
+    bot_usdc_wallet_balance_live = await get_token_balance(usdc_token_contract, BOT_WALLET_ADDRESS)
+    
+    if bot_usdc_wallet_balance_live <= Decimal("0.000001"): # Or a small dust threshold
+        await send_tg_message(context, "ℹ️ No significant USDC available in wallet to withdraw.")
+        return
+
+    profit_before_withdrawal = bot_state.get('accumulated_profit_usdc', Decimal(0))
+
+    await _execute_fund_withdrawal(context, bot_usdc_wallet_balance_live, usdc_token_contract, "Wallet USDC")
+    
+    profit_component_in_this_withdrawal = min(profit_before_withdrawal, bot_usdc_wallet_balance_live)
+    
+    if profit_component_in_this_withdrawal > 0:
+        bot_state["accumulated_profit_usdc"] = profit_before_withdrawal - profit_component_in_this_withdrawal
+        logger.info(f"Adjusted tracked profit after 'Withdraw ALL Wallet USDC'. "
+                    f"Amount of profit included in withdrawal: {profit_component_in_this_withdrawal:.2f}. "
+                    f"New tracked profit: {bot_state['accumulated_profit_usdc']:.2f}")
+        await save_state_async()
+        await send_tg_message(context, 
+            f"ℹ️ Tracked profit was reduced by `{profit_component_in_this_withdrawal:.2f}` USDC as it was part of the total wallet withdrawal.\n"
+            f"Remaining tracked profit: `{bot_state['accumulated_profit_usdc']:.2f}` USDC."
+        )
 
 async def handle_set_initial_lp_nft_id_action(context: CallbackContext, nft_id: int):
     await send_tg_message(context, f"Attempting to load LP: {nft_id}...", menu_type=None)
@@ -2109,22 +2124,6 @@ async def handle_withdraw_profit_menu_action(context: CallbackContext):
         "Choose an option:"
     )
     await send_tg_message(context, message, menu_type="profit_withdrawal")
-
-async def handle_withdraw_wallet_usdc_menu_action(context: CallbackContext):
-    if not USER_PROFIT_WITHDRAWAL_ADDRESS or "YOUR_PERSONAL_WALLET_ADDRESS" in USER_PROFIT_WITHDRAWAL_ADDRESS:
-        await send_tg_message(context, "⚠️ Withdrawal address is not configured.")
-        return
-        
-    bot_usdc_balance_live = await get_token_balance(usdc_token_contract, BOT_WALLET_ADDRESS)
-    usdc_decimals = await asyncio.to_thread(usdc_token_contract.functions.decimals().call)
-    balance_str = f"{bot_usdc_balance_live:.{usdc_decimals}f} USDC"
-    
-    message = (
-        f"Available liquid USDC in bot wallet: {balance_str}\n"
-        f"Withdrawals sent to: `{USER_PROFIT_WITHDRAWAL_ADDRESS}`\n\n"
-        "Choose an option for WALLET USDC:"
-    )
-    await send_tg_message(context, message, menu_type="withdraw_wallet_usdc")
 
 async def handle_withdraw_wallet_usdc_menu_action(context: CallbackContext):
     if not USER_PROFIT_WITHDRAWAL_ADDRESS or "YOUR_PERSONAL_WALLET_ADDRESS" in USER_PROFIT_WITHDRAWAL_ADDRESS:
@@ -2281,41 +2280,62 @@ async def process_full_rebalance(context: CallbackContext, triggered_by="auto"):
             await send_tg_message(context, "ℹ️ No existing LP found. Will use wallet funds for new position.", menu_type=None)
 
         # 3. Consolidate funds
-        available_wblt = await get_token_balance(wblt_token_contract, BOT_WALLET_ADDRESS)
-        available_usdc = await get_token_balance(usdc_token_contract, BOT_WALLET_ADDRESS)
-        available_aero = await get_token_balance(aero_token_contract, BOT_WALLET_ADDRESS)
-        logger.info(f"Consolidated Funds - WBLT: {available_wblt}, USDC: {available_usdc}, AERO: {available_aero}")
-
-        # 4. Sell ALL AERO (from wallet, which includes any just auto-claimed from unstake)
-        logger.info("Attempting to sell any AERO present in the wallet...")
-        if initial_wallet_aero > Decimal("1.0"):
-            sell_success, usdc_from_aero_sale = await _sell_all_available_aero_in_wallet(context)
-            if sell_success and usdc_from_aero_sale > 0:
-                if bot_state["current_strategy"] == "take_profit":
-                    bot_state["accumulated_profit_usdc"] = bot_state.get("accumulated_profit_usdc", Decimal(0)) + usdc_from_aero_sale
-                    logger.info(f"Added {usdc_from_aero_sale:.2f} USDC from AERO sale to accumulated profit. New total: {bot_state['accumulated_profit_usdc']:.2f}")
-                else:
-                    working_usdc += usdc_from_aero_sale
-                    logger.info(f"Added {usdc_from_aero_sale:.2f} USDC from AERO sale to working USDC for compounding.")
-
-        logger.info(f"Funds after AERO sale processing - Working WBLT: {working_wblt:.8f}, Working USDC: {working_usdc:.8f}, Tracked Profit: {bot_state.get('accumulated_profit_usdc', Decimal(0)):.2f}")
+        wblt_for_rebalance = await get_token_balance(wblt_token_contract, BOT_WALLET_ADDRESS)
+        usdc_total_in_wallet = await get_token_balance(usdc_token_contract, BOT_WALLET_ADDRESS)
+        aero_in_wallet = await get_token_balance(aero_token_contract, BOT_WALLET_ADDRESS)
         
-        usdc_for_lp_operations = working_usdc
+        logger.info(f"Funds after dismantling old LP - WBLT: {wblt_for_rebalance:.8f}, "
+                    f"Total Wallet USDC: {usdc_total_in_wallet:.8f}, AERO: {aero_in_wallet:.8f}")
+
+        # Initialize working balances for this rebalance cycle
+        current_working_wblt = wblt_for_rebalance
+        current_working_usdc = usdc_total_in_wallet
+
+        # --- Handle pre-existing tracked profit if strategy is "compound" ---
+        if bot_state["current_strategy"] == "compound":
+            pre_existing_profit = bot_state.get("accumulated_profit_usdc", Decimal(0))
+            if pre_existing_profit > 0:
+                logger.info(f"Compound Strategy: Folding back {pre_existing_profit:.2f} USDC of previously tracked profit into working capital.")
+                bot_state["accumulated_profit_usdc"] = Decimal(0)
+                await send_tg_message(context, f"ℹ️ Compounding: `{pre_existing_profit:.2f}` USDC of previously tracked profit is now part of the main capital.", menu_type=None)
+
+        # 4. Sell ALL AERO
+        logger.info("Attempting to sell any AERO present in the wallet...")
+        if aero_in_wallet > Decimal("0"):
+            sell_success, usdc_gained_from_aero_sale = await _sell_all_available_aero_in_wallet(context)
+            
+            if sell_success and usdc_gained_from_aero_sale > 0:
+                current_working_usdc += usdc_gained_from_aero_sale
+                
+                if bot_state["current_strategy"] == "take_profit":
+                    bot_state["accumulated_profit_usdc"] = bot_state.get("accumulated_profit_usdc", Decimal(0)) + usdc_gained_from_aero_sale
+                    logger.info(f"Added {usdc_gained_from_aero_sale:.2f} USDC from AERO sale to accumulated profit. New total tracked profit: {bot_state['accumulated_profit_usdc']:.2f}")
+                    await send_tg_message(context, f"✅ AERO sold. Profit of `{usdc_gained_from_aero_sale:.2f}` USDC added to profit pool.", menu_type=None)
+                else:
+                    logger.info(f"Added {usdc_gained_from_aero_sale:.2f} USDC from AERO sale directly to working capital (compound strategy).")
+                    await send_tg_message(context, f"✅ AERO sold for `{usdc_gained_from_aero_sale:.2f}` USDC. Added to available USDC for compounding.", menu_type=None)
+        
+        logger.info(f"Funds after AERO sale processing - Working WBLT: {current_working_wblt:.8f}, Total Wallet USDC: {current_working_usdc:.8f}, Tracked Profit: {bot_state.get('accumulated_profit_usdc', Decimal(0)):.2f}")
+        
+        # --- Determine USDC actually available for LP operations (excluding total tracked profit if in "take_profit") ---
+        usdc_for_lp_operations = current_working_usdc 
         if bot_state["current_strategy"] == "take_profit":
-            profit_to_set_aside = bot_state.get("accumulated_profit_usdc", Decimal(0)) 
-            current_physical_wallet_usdc = await get_token_balance(usdc_token_contract, BOT_WALLET_ADDRESS)
-            usdc_for_lp_operations = current_physical_wallet_usdc - profit_to_set_aside
+            total_tracked_profit = bot_state.get("accumulated_profit_usdc", Decimal(0))
+            usdc_for_lp_operations = current_working_usdc - total_tracked_profit
             
             if usdc_for_lp_operations < Decimal(0):
-                logger.warning(f"Tracked profit {profit_to_set_aside:.2f} exceeds current physical wallet USDC {current_physical_wallet_usdc:.2f}. "
-                               f"Using 0 USDC for LP operations. This may indicate a discrepancy.")
+                logger.warning(f"Tracked profit ({total_tracked_profit:.2f}) exceeds current physical wallet USDC ({current_working_usdc:.2f}). "
+                               f"Using 0 USDC for LP operations.")
                 usdc_for_lp_operations = Decimal(0)
             
-            logger.info(f"Take Profit Mode: Physical Wallet USDC: {current_physical_wallet_usdc:.2f}. "
-                        f"Tracked Profit to set aside: {profit_to_set_aside:.2f}. "
-                        f"USDC available for LP operations: {usdc_for_lp_operations:.2f}")
-        
-        logger.info(f"Final funds for LP operations - WBLT: {working_wblt:.8f}, USDC: {usdc_for_lp_operations:.8f}")
+            logger.info(f"Take Profit Mode: Total Physical Wallet USDC: {current_working_usdc:.2f}. "
+                        f"Total Tracked Profit to set aside: {total_tracked_profit:.2f}. "
+                        f"USDC effectively available for LP operations: {usdc_for_lp_operations:.2f}")
+        else: # Compound mode
+            logger.info(f"Compound Mode: All Total Wallet USDC ({current_working_usdc:.2f}) is available for LP operations.")
+            # usdc_for_lp_operations is already current_working_usdc
+
+        logger.info(f"Final funds to be used for LP operations - WBLT: {current_working_wblt:.8f}, USDC: {usdc_for_lp_operations:.8f}")
         
         # 5. Determine New Optimal LP Range
         price_wblt_human_for_range, pool_current_tick = await get_aerodrome_pool_price_and_tick()
@@ -2349,8 +2369,9 @@ async def process_full_rebalance(context: CallbackContext, triggered_by="auto"):
         logger.info("Performing targeted swap (if needed) to optimize token ratio for the chosen LP range using all available capital...")
         final_wblt_for_mint, final_usdc_for_mint = await _perform_targeted_swap_for_optimal_ratio(
             context,
-            pool_current_tick, new_tick_lower, new_tick_upper,
-            working_wblt, usdc_for_lp_operations,
+            current_pool_sqrt_price_x96_raw,
+            new_tick_lower, new_tick_upper,
+            current_working_wblt, usdc_for_lp_operations, 
             price_wblt_human_for_range,
             wblt_decimals_val,
             usdc_decimals_val
@@ -2409,7 +2430,7 @@ async def process_full_rebalance(context: CallbackContext, triggered_by="auto"):
         logger.info(f"Prepared 12-ELEMENT params tuple for mint: {mint_params_as_tuple}")
 
         await send_tg_message(context, f"ℹ️ Minting new LP...", menu_type=None)
-        
+
         # Wrap the mint operation
         mint_op_callable = functools.partial(_execute_mint_lp_operation, context, mint_params_as_tuple)
     
@@ -2884,7 +2905,6 @@ async def main_bot_loop(application: Application):
             except Exception as te:
                 logger.error(f"Failed to send critical error message to Telegram: {te}")
             await asyncio.sleep(MAIN_LOOP_INTERVAL_SECONDS * 2)
-
 
 async def approve_nft_for_spending(
     context: CallbackContext, 
